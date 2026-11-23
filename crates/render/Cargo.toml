@@ -1,0 +1,19 @@
+[package]
+name = "render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+glam.workspace = true
+bytemuck.workspace = true
+molecule.workspace = true
+wgpu = "25"
+pollster = "0.4"
+rayon = "1"
+fast-surface-nets = "0.2"
+serde.workspace = true
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }

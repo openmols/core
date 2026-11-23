@@ -1,0 +1,11 @@
+[package]
+name = "molecule"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+glam.workspace = true
+pdbtbx = "0.12"
+nalgebra = "0.33"
