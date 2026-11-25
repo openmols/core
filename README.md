@@ -35,8 +35,8 @@ The viewer, measurements and the assistant work without Docker; docking and pock
 The tool images (pyKVFinder, AutoDock) are published from this repository to
 `ghcr.io/openmols/…` and pulled automatically the first time you run a job (the AutoDock image
 is about 1.8 GB); if the pull fails, openmols builds the same image locally from its
-Dockerfile. FRODOCK is the exception: it can't be redistributed, so it is built from your own
-copy (Settings → Tools).
+Dockerfile. FRODOCK has no published licence, so its image is only published once the authors
+have given permission; until then it is built from your own copy (Settings → Tools).
 
 ## What it does
 

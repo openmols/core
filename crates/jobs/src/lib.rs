@@ -26,8 +26,9 @@ pub struct ToolImage {
     /// Image tag; bump the version when the Dockerfile changes.
     pub tag: &'static str,
     /// Where CI publishes the same image (same version as `tag`). Pulled on
-    /// first use instead of building; `None` for software we may not
-    /// redistribute.
+    /// first use instead of building. `needs_context` images (FRODOCK) are
+    /// only published while the maintainers have permission to redistribute
+    /// them; when the pull fails they are built from the user's own copy.
     pub registry: Option<&'static str>,
     pub dockerfile: &'static str,
     pub gpu: bool,
@@ -52,7 +53,7 @@ pub const FRODOCK: ToolImage = ToolImage {
     tool: "frodock",
     label: "FRODOCK",
     tag: "openmols/frodock:1",
-    registry: None,
+    registry: Some("ghcr.io/openmols/frodock:1"),
     dockerfile: include_str!("../../../docker/frodock/Dockerfile"),
     gpu: false,
     needs_context: true,
@@ -163,7 +164,7 @@ fn pull_image(image: &ToolImage, registry: &str, log: &Path) -> Result<()> {
 pub fn build_image(image: &ToolImage, context: Option<&Path>, log: &Path) -> Result<()> {
     if image.needs_context && context.is_none() {
         bail!(
-            "{} is built from your own copy of the software — set its folder in the Tools panel first",
+            "the {} image could not be downloaded, and it can only be built from your own copy of the software — set its folder in Settings → Tools",
             image.label
         );
     }
@@ -294,11 +295,15 @@ mod tests {
                     assert!(t.dockerfile.contains("org.opencontainers.image.licenses"), "{}: no licence label", t.tool);
                     assert!(t.dockerfile.contains("org.opencontainers.image.source"), "{}: no source label", t.tool);
                 }
-                // Software we may not redistribute is built from the user's copy.
+                // Without a published image the only way to get one is the user's own copy.
                 None => assert!(t.needs_context, "{} has no registry image and no user copy", t.tool),
             }
+            // Software that needs a user copy is only published behind an explicit switch,
+            // so nobody redistributes it by accident.
+            if t.needs_context {
+                assert!(workflow.contains("vars.PUBLISH_"), "{} must be published behind a PUBLISH_* switch", t.tool);
+            }
         }
-        assert_eq!(FRODOCK.registry, None, "FRODOCK must never be published");
     }
 
     #[test]

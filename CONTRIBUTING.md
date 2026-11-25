@@ -33,7 +33,8 @@ are the template.
 
 1. **Image.** `docker/<tool>/Dockerfile`, built from packages that can be redistributed
    (conda-forge, bioconda, apt). If the software cannot be redistributed, build the image
-   from a folder the user supplies, as FRODOCK does (`needs_context`). Register it in
+   from a folder the user supplies, as FRODOCK does (`needs_context`), and publish it only behind a
+   `PUBLISH_*` switch once you have permission. Register it in
    `crates/jobs/src/lib.rs` (`ToolImage`, `TOOLS`), give redistributable images a `registry`
    name, add the tool to the matrix in `.github/workflows/containers.yml` (a test keeps the
    names and `IMAGE_VERSION` in step), and put OCI `source` and `licenses` labels in the

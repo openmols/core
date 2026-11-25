@@ -8,6 +8,9 @@
 # Cite: Garzon et al. 2009 Bioinformatics 25:2544-2551;
 #       Ramirez-Aportela et al. 2016 Bioinformatics 32:2386-2388.
 FROM debian:bookworm-slim
+LABEL org.opencontainers.image.source="https://github.com/chaconlab/FRODOCK" \
+      org.opencontainers.image.description="FRODOCK protein-protein docking, packaged for openmols" \
+      org.opencontainers.image.licenses="NOASSERTION"
 
 # frodock links against single-precision FFTW (-lfftw3f).
 RUN apt-get update \

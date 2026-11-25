@@ -15,7 +15,7 @@ against them or ship their code.
 | [RDKit](https://www.rdkit.org/) | BSD-3-Clause | conda-forge `rdkit` |
 | [Open Babel](https://openbabel.org/) | GPL-2.0 | conda-forge `openbabel` |
 | [pyKVFinder](https://github.com/LBC-LNBio/pyKVFinder) | GPL-3.0 | `docker/pykvfinder/Dockerfile` (pip) |
-| [FRODOCK](https://github.com/chaconlab/FRODOCK) | no licence published | **not redistributed**: see below |
+| [FRODOCK](https://github.com/chaconlab/FRODOCK) | no licence published | published only with the authors' permission (switched off by default): see below |
 
 ### Where the images come from
 
@@ -30,14 +30,22 @@ point here. The exact package versions are the ones the Dockerfile installs; the
 code is available from the upstream projects and the conda-forge / bioconda package recipes
 linked above. Anyone redistributing the images should keep this notice with them.
 
-FRODOCK is never published (see below).
+FRODOCK is a special case (see below).
 
 ### FRODOCK
 
-The FRODOCK repository carries no licence file, so openmols neither downloads nor ships it.
-To use it you point **Settings → Tools** at your own copy and the image is built from that
-folder locally. Check the terms with its authors before sharing the built image or using it
-commercially.
+The FRODOCK repository carries no licence file, so by default nobody may redistribute it.
+openmols therefore does not ship it, and the CI job that would publish a FRODOCK image
+(`frodock` in `.github/workflows/containers.yml`) is **switched off** until the maintainers
+have the authors' permission and set the repository variable `PUBLISH_FRODOCK` to `true`.
+
+- While it is off, users build the image on their own machine from their own copy of FRODOCK
+  (**Settings → Tools**).
+- Once it is on, the app pulls `ghcr.io/openmols/frodock` like the other images and the folder
+  is only a fallback.
+
+Do not turn the switch on without that permission, and check the authors' terms before
+sharing a built image or using it commercially.
 
 ## Please cite what you use
 

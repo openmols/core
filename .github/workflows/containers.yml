@@ -4,13 +4,14 @@ name: Containers
 # GitHub Container Registry, so users pull them instead of building for minutes.
 # The app asks for ghcr.io/openmols/<tool>:<IMAGE_VERSION> (see crates/jobs/src/lib.rs);
 # bump IMAGE_VERSION here and the tags there together when a Dockerfile changes.
-# FRODOCK is deliberately not built here: it cannot be redistributed.
+# FRODOCK is built only behind a switch (see the frodock job): it has no licence.
 on:
   push:
     branches: [main]
     paths:
       - "docker/pykvfinder/**"
       - "docker/autodock/**"
+      - "docker/frodock/**"
       - ".github/workflows/containers.yml"
   pull_request:
     paths:
@@ -57,3 +58,37 @@ jobs:
           tags: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}:${{ env.IMAGE_VERSION }}
           cache-from: type=gha,scope=${{ matrix.image }}
           cache-to: type=gha,scope=${{ matrix.image }},mode=max
+
+  # FRODOCK's repository carries no licence, so this job only runs once the
+  # maintainers have the authors' permission to redistribute it and have set the
+  # repository variable PUBLISH_FRODOCK to "true" (Settings -> Secrets and
+  # variables -> Actions -> Variables). Until then users build it from their own copy.
+  frodock:
+    name: frodock (only with permission)
+    if: ${{ github.event_name != 'pull_request' && vars.PUBLISH_FRODOCK == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch FRODOCK
+        run: |
+          git clone --depth 1 https://github.com/chaconlab/FRODOCK.git frodock-src
+          rm -rf frodock-src/.git
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: frodock-src
+          file: docker/frodock/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/frodock:${{ env.IMAGE_VERSION }}
