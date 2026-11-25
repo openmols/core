@@ -293,7 +293,7 @@ impl Workspace {
                 let result = (|| -> Result<i32> {
                     jobs::docker_version()?;
                     if !jobs::image_present(&worker_spec.image) {
-                        jobs::build_image(
+                        jobs::ensure_image(
                             &worker_spec.image,
                             context.as_deref(),
                             &worker_spec.host_dir().join("build.log"),

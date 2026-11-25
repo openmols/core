@@ -34,7 +34,10 @@ are the template.
 1. **Image.** `docker/<tool>/Dockerfile`, built from packages that can be redistributed
    (conda-forge, bioconda, apt). If the software cannot be redistributed, build the image
    from a folder the user supplies, as FRODOCK does (`needs_context`). Register it in
-   `crates/jobs/src/lib.rs` (`ToolImage`, `TOOLS`).
+   `crates/jobs/src/lib.rs` (`ToolImage`, `TOOLS`), give redistributable images a `registry`
+   name, add the tool to the matrix in `.github/workflows/containers.yml` (a test keeps the
+   names and `IMAGE_VERSION` in step), and put OCI `source` and `licenses` labels in the
+   Dockerfile. Bump the `:N` tag everywhere when a Dockerfile changes.
 2. **Command builder and parser** in `crates/jobs/src/<tool>.rs`.
    `command(settings) -> Result<String>` returns the shell script run in the job folder;
    refuse bad input there (it ends up in a shell). Write `parse_*` against a real output

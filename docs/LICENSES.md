@@ -17,8 +17,20 @@ against them or ship their code.
 | [pyKVFinder](https://github.com/LBC-LNBio/pyKVFinder) | GPL-3.0 | `docker/pykvfinder/Dockerfile` (pip) |
 | [FRODOCK](https://github.com/chaconlab/FRODOCK) | no licence published | **not redistributed**: see below |
 
-Images are built on the user's machine from the Dockerfiles in `docker/`. openmols does
-not publish or distribute built images.
+### Where the images come from
+
+The pyKVFinder and AutoDock images are built by CI from the Dockerfiles in `docker/` and
+published to the GitHub Container Registry (`ghcr.io/openmols/pykvfinder`,
+`ghcr.io/openmols/autodock`), so users download them instead of building for several minutes.
+If a pull fails the app builds the same image locally from the Dockerfile it carries.
+
+Publishing those images distributes GPL software (AutoDock4, Open Babel, pyKVFinder) in
+binary form. Each image's `org.opencontainers.image.licenses` and `.source` labels say so and
+point here. The exact package versions are the ones the Dockerfile installs; their source
+code is available from the upstream projects and the conda-forge / bioconda package recipes
+linked above. Anyone redistributing the images should keep this notice with them.
+
+FRODOCK is never published (see below).
 
 ### FRODOCK
 

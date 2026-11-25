@@ -32,6 +32,11 @@ The builds are not code-signed yet, so your system will ask before the first lau
 Intel Macs and other Linux architectures: build from source for now (below).
 The viewer, measurements and the assistant work without Docker; docking and pockets need
 [Docker](https://www.docker.com/) running (Docker Desktop on Windows and macOS).
+The tool images (pyKVFinder, AutoDock) are published from this repository to
+`ghcr.io/openmols/…` and pulled automatically the first time you run a job (the AutoDock image
+is about 1.8 GB); if the pull fails, openmols builds the same image locally from its
+Dockerfile. FRODOCK is the exception: it can't be redistributed, so it is built from your own
+copy (Settings → Tools).
 
 ## What it does
 
