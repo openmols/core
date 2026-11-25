@@ -48,6 +48,14 @@ are the template.
    (jobs that take minutes are dispatched in `chat.rs`).
 6. Update `ROADMAP.md` and `docs/LICENSES.md`.
 
+## Releases
+
+Pushing a tag like `v0.1.0` runs `.github/workflows/release.yml`, which builds the app for
+Windows, macOS (Apple silicon) and Linux, packages it, and attaches the archives and a
+`SHA256SUMS.txt` to a GitHub Release. Before tagging, bump `version` in the root `Cargo.toml`
+and the version string in the macOS `Info.plist` step of the workflow. "Run workflow" on the
+Release workflow builds the same archives without publishing, which is a good dry run.
+
 ## Pull requests
 
 Small, focused changes with a line on how you checked them. Screenshots help for anything visual.
