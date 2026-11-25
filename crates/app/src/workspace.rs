@@ -2,8 +2,8 @@
 //! drawer (right). Owns the open project and the user config.
 
 use crate::chat::ChatPanel;
-use crate::config::Config;
-use crate::jobs_ui::CavityResults;
+use crate::config::{Config, LeftTab};
+use crate::jobs_ui::{CavityResults, DockSetup, DockingResults, EnsemblePockets};
 use crate::tools;
 use crate::viewer::{EntityState, ViewState, Viewer, ViewerEvent};
 use anyhow::{Context as _, Result};
@@ -12,9 +12,10 @@ use gpui::{
     PathPromptOptions, Render, SharedString, Styled, Subscription, Window, div, prelude::*, px, rgb,
 };
 use gpui_component::{
-    Sizable,
+    IconName, Sizable,
     button::{Button, ButtonVariants},
     input::{Input, InputEvent, InputState},
+    resizable::{ResizableState, h_resizable, resizable_panel},
 };
 use molecule::Structure;
 use molecule::align::AlignOptions;
@@ -23,8 +24,11 @@ use render::{Coloring, Component, Representation, Target};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-const LEFT_WIDTH: f32 = 300.0;
+const LEFT_WIDTH: f32 = 290.0;
 const RIGHT_WIDTH: f32 = 400.0;
+/// Drag limits for the side drawers.
+const SIDE_MIN: f32 = 220.0;
+const SIDE_MAX: f32 = 720.0;
 
 pub struct Workspace {
     pub viewer: Entity<Viewer>,
@@ -32,6 +36,11 @@ pub struct Workspace {
     pub project: Option<Project>,
     pub config: Config,
     new_project_name: Entity<InputState>,
+    /// Editable pocket filter rules, one per line.
+    pub(crate) pocket_filter: Entity<InputState>,
+    /// Filter text waiting to be shown in that editor. Setting an input
+    /// needs a Window, which only the render pass has.
+    pub(crate) pending_filter_text: Option<String>,
     left_open: bool,
     right_open: bool,
     pub(crate) status: Option<String>,
@@ -40,8 +49,39 @@ pub struct Workspace {
     /// Running jobs → container name (for cancellation).
     pub(crate) running: HashMap<Id, String>,
     pub(crate) cavities: Option<CavityResults>,
-    pub(crate) kv_ligand_adjust: bool,
+    pub(crate) docking: Option<DockingResults>,
+    /// Volume/surface figures of the last Measure run.
+    pub(crate) metrics: Option<Vec<(String, String)>>,
+    pub(crate) metrics_busy: bool,
+    pub(crate) ensemble: Option<EnsemblePockets>,
+    /// Which entities the Dock button will send to FRODOCK, and how.
+    pub(crate) dock: DockSetup,
+    /// Structures being read on a worker thread: id → name, for the status
+    /// line and to stop a second click starting the same read again.
+    pub(crate) loading: HashMap<Id, String>,
+    /// Structures waiting for the current read to finish.
+    pub(crate) load_queue: Vec<(Id, bool)>,
+    /// Widths of the three resizable columns (drawers + viewport).
+    layout: Entity<ResizableState>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// ` (1.2 GB)` for a file worth warning about, nothing for a small one.
+fn describe_size(bytes: u64) -> String {
+    const MB: f64 = 1024.0 * 1024.0;
+    match bytes as f64 / MB {
+        mb if mb >= 1024.0 => format!(" ({:.1} GB)", mb / 1024.0),
+        mb if mb >= 20.0 => format!(" ({mb:.0} MB)"),
+        _ => String::new(),
+    }
+}
+
+/// Does this look like a structure openmols can read?
+fn is_structure_file(path: &std::path::Path) -> bool {
+    let lower = path.to_string_lossy().to_lowercase();
+    let lower = lower.strip_suffix(".gz").unwrap_or(&lower);
+    molecule::is_pdb_like(lower)
+        || [".cif", ".mmcif", ".sdf", ".mol"].iter().any(|e| lower.ends_with(e))
 }
 
 pub(crate) fn muted() -> Hsla {
@@ -56,6 +96,48 @@ pub(crate) fn section(title: &'static str) -> gpui::Div {
             .text_color(muted())
             .child(title.to_uppercase()),
     )
+}
+
+/// A section without its heading: [`Workspace::fold`] supplies a clickable one.
+pub(crate) fn section_body() -> gpui::Div {
+    div().flex().flex_col().gap_1()
+}
+
+/// A small heading for a part of a panel.
+pub(crate) fn heading(title: &'static str) -> gpui::Div {
+    div()
+        .pt_2()
+        .text_xs()
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(muted())
+        .child(title.to_uppercase())
+}
+
+/// A sub-heading with rows under it, for read-only figures.
+pub(crate) fn section_rows(title: &'static str) -> gpui::Div {
+    div()
+        .flex()
+        .flex_col()
+        .mt_1()
+        .child(
+            div()
+                .text_xs()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(muted())
+                .child(title.to_uppercase()),
+        )
+}
+
+/// `name   value`, the name muted and the value right-aligned.
+pub(crate) fn stat_row(name: impl Into<SharedString>, value: impl Into<SharedString>) -> gpui::Div {
+    div()
+        .flex()
+        .justify_between()
+        .gap_2()
+        .px_2()
+        .text_xs()
+        .child(div().text_color(muted()).child(name.into()))
+        .child(div().child(value.into()))
 }
 
 fn list_row(id: impl Into<gpui::ElementId>, label: impl Into<SharedString>, active: bool) -> gpui::Stateful<gpui::Div> {
@@ -77,6 +159,14 @@ impl Workspace {
         let weak = cx.entity().downgrade();
         let chat = cx.new(|cx| ChatPanel::new(weak, window, cx));
         let new_project_name = cx.new(|cx| InputState::new(window, cx).placeholder("New project name"));
+        let pocket_filter = cx.new(|cx| {
+            InputState::new(window, cx)
+                .multi_line(true)
+                .auto_grow(3, 12)
+                .placeholder("volume >= 120
+hydropathy <= 0
+overlap 0.6")
+        });
         let subscriptions = vec![
             cx.subscribe(&viewer, |this, _, event: &ViewerEvent, cx| {
                 if let ViewerEvent::Picked(pick) = event {
@@ -96,18 +186,32 @@ impl Workspace {
             project: None,
             config: Config::load(),
             new_project_name,
+            pocket_filter,
+            pending_filter_text: None,
             left_open: true,
             right_open: true,
             status: None,
             docker: None,
             running: HashMap::new(),
             cavities: None,
-            kv_ligand_adjust: false,
+            docking: None,
+            metrics: None,
+            metrics_busy: false,
+            ensemble: None,
+            dock: DockSetup::default(),
+            loading: HashMap::new(),
+            load_queue: Vec::new(),
+            layout: cx.new(|_| ResizableState::default()),
             _subscriptions: subscriptions,
         };
         this.check_docker(cx);
-        let model = this.config.provider().map(|p| p.model.clone()).unwrap_or_default();
-        this.chat.update(cx, |c, cx| c.set_model_field(model, window, cx));
+        {
+            let d = &this.config.job_defaults;
+            this.dock.top_n = d.dock_top_n;
+            this.dock.cluster_rmsd = d.dock_cluster_rmsd;
+            this.dock.around_ligand = d.dock_around_ligand;
+            this.dock.restrain_to_selection = d.dock_restrain_to_selection;
+        }
 
         match initial {
             Some(path) if Project::is_project(&path) => this.open_project(path, cx),
@@ -144,12 +248,14 @@ impl Workspace {
         cx.notify();
     }
 
-    fn set_project(&mut self, project: Project, cx: &mut Context<Self>) {
+    pub(crate) fn set_project(&mut self, project: Project, cx: &mut Context<Self>) {
         self.config.touch_recent(project.root().to_path_buf());
         let first = project.structures().ok().and_then(|s| s.first().map(|e| e.id));
         self.project = Some(project);
         self.running.clear();
         self.restore_cavity_results();
+        self.restore_docking_results();
+        self.restore_ensemble_results(cx);
         self.viewer.update(cx, |v, cx| v.clear(cx));
         if let Some(id) = first {
             self.load_structure(id, cx).ok();
@@ -223,6 +329,8 @@ impl Workspace {
     fn close_project(&mut self, cx: &mut Context<Self>) {
         self.project = None;
         self.cavities = None;
+        self.docking = None;
+        self.ensemble = None;
         self.viewer.update(cx, |v, cx| v.clear(cx));
         self.chat.update(cx, |c, cx| c.new_conversation(cx));
         cx.notify();
@@ -230,7 +338,7 @@ impl Workspace {
 
     // ------------------------------------------------------------ structures
 
-    fn read_structure(&self, id: Id) -> Result<Structure> {
+    pub(crate) fn read_structure(&self, id: Id) -> Result<Structure> {
         let project = self.project.as_ref().context("no project is open")?;
         let entry = project
             .structure(id)?
@@ -238,6 +346,94 @@ impl Workspace {
         let mut structure = Structure::load(project.structure_path(&entry))?;
         structure.name = entry.name.clone();
         Ok(structure)
+    }
+
+    /// Read a project structure on a worker thread, then put it in the scene.
+    ///
+    /// Parsing is the slow part of opening a structure — seconds for a
+    /// trajectory of a thousand frames, which is over a gigabyte of text —
+    /// and on the UI thread that freezes the window. Only the finished
+    /// structure comes back to be added, which takes milliseconds.
+    /// Queued behind any read already in flight, so adding a folder of
+    /// trajectories does not try to hold them all in memory at once.
+    pub fn load_structure_async(&mut self, id: Id, replace: bool, cx: &mut Context<Self>) {
+        if self.loading.contains_key(&id) || self.load_queue.iter().any(|(q, _)| *q == id) {
+            return;
+        }
+        if self.loading.is_empty() {
+            self.begin_structure_load(id, replace, cx);
+        } else {
+            self.load_queue.push((id, replace));
+            cx.notify();
+        }
+    }
+
+    fn begin_structure_load(&mut self, id: Id, replace: bool, cx: &mut Context<Self>) {
+        let entry = match self
+            .project
+            .as_ref()
+            .context("no project is open")
+            .and_then(|p| p.structure(id))
+        {
+            Ok(Some(entry)) => entry,
+            Ok(None) => {
+                self.status = Some(format!("no structure with id {id}"));
+                return;
+            }
+            Err(e) => {
+                self.status = Some(format!("{e:#}"));
+                return;
+            }
+        };
+        let Some(project) = self.project.as_ref() else { return };
+        let path = project.structure_path(&entry);
+        let name = entry.name.clone();
+        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        self.loading.insert(id, name.clone());
+        self.status = Some(format!("Reading {name}{}…", describe_size(size)));
+        cx.notify();
+
+        let (tx, rx) = futures::channel::oneshot::channel();
+        let thread_name = name.clone();
+        std::thread::spawn(move || {
+            let result = Structure::load(&path).map(|mut s| {
+                s.name = thread_name;
+                s
+            });
+            let _ = tx.send(result.map_err(|e| format!("{e:#}")));
+        });
+
+        cx.spawn(async move |this, cx| {
+            let result = rx.await;
+            this.update(cx, |ws, cx| {
+                ws.loading.remove(&id);
+                match result {
+                    Ok(Ok(structure)) => {
+                        let (atoms, frames) = (structure.atoms.len(), structure.frame_count());
+                        ws.viewer.update(cx, |v, cx| {
+                            if replace {
+                                v.set_structure(structure, Some(id), cx);
+                            } else {
+                                v.add_structure(structure, Some(id), cx);
+                            }
+                        });
+                        ws.status = Some(match frames {
+                            1 => format!("{name}: {atoms} atoms"),
+                            n => format!("{name}: {atoms} atoms, {n} frames"),
+                        });
+                    }
+                    Ok(Err(e)) => ws.status = Some(e),
+                    Err(_) => ws.status = Some(format!("reading {name} was interrupted")),
+                }
+                if !ws.load_queue.is_empty() {
+                    let (next, replace) = ws.load_queue.remove(0);
+                    ws.begin_structure_load(next, replace, cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Replace the scene with one project structure.
@@ -274,9 +470,7 @@ impl Workspace {
             }
         }
         for id in added {
-            if let Err(e) = self.add_structure_to_scene(id, cx) {
-                self.status = Some(format!("{e:#}"));
-            }
+            self.load_structure_async(id, false, cx);
         }
         cx.notify();
     }
@@ -307,6 +501,53 @@ impl Workspace {
             }
         })
         .detach();
+    }
+
+    /// Add every structure file in a folder.
+    ///
+    /// Windows' dialog shows either files or folders, never both, so picking
+    /// a folder of structures needs its own action.
+    fn prompt_add_folder(&mut self, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Add every structure in this folder".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = paths.await
+                && let Some(folder) = paths.into_iter().next()
+            {
+                this.update(cx, |this, cx| this.add_folder(folder, cx)).ok();
+            }
+        })
+        .detach();
+    }
+
+    fn add_folder(&mut self, folder: PathBuf, cx: &mut Context<Self>) {
+        let Ok(entries) = std::fs::read_dir(&folder) else {
+            self.status = Some(format!("Could not read {}", folder.display()));
+            cx.notify();
+            return;
+        };
+        let mut files: Vec<PathBuf> = entries
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.is_file() && is_structure_file(p))
+            .collect();
+        files.sort();
+        if files.is_empty() {
+            self.status = Some(format!(
+                "No .pdb, .cif, .sdf or .mol files in {}",
+                folder.display()
+            ));
+            cx.notify();
+            return;
+        }
+        let count = files.len();
+        self.add_files(files, cx);
+        self.status = Some(format!("Added {count} structure file(s) from {}", folder.display()));
+        cx.notify();
     }
 
     /// Write an entity's posed coordinates into the project as a new structure.
@@ -375,6 +616,8 @@ impl Workspace {
                 v.apply_entity_state(index, &entity, cx);
             }
             v.set_active_index(state.active);
+            v.set_annotations(state.annotations.clone(), cx);
+            v.set_annotation_hidden(state.annotation_hidden.clone(), cx);
             v.set_camera(state.camera, cx);
         });
         cx.notify();
@@ -441,7 +684,42 @@ impl Workspace {
     fn render_scene_section(&mut self, cx: &mut Context<Self>) -> gpui::Div {
         let viewer = self.viewer.read(cx);
         let active = viewer.active_index();
-        let mut scene = section("Scene");
+        let mut scene = section_body();
+        if viewer.entities().len() > 1 {
+            scene = scene.child(
+                div()
+                    .flex()
+                    .gap_1()
+                    .child(
+                        Button::new("show-all")
+                            .icon(IconName::Eye)
+                            .label("Show all")
+                            .ghost()
+                            .xsmall()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.viewer.update(cx, |v, cx| {
+                                    for j in 0..v.entities().len() {
+                                        v.set_visible(j, true, cx);
+                                    }
+                                });
+                            })),
+                    )
+                    .child(
+                        Button::new("hide-all")
+                            .icon(IconName::EyeOff)
+                            .label("Hide all")
+                            .ghost()
+                            .xsmall()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.viewer.update(cx, |v, cx| {
+                                    for j in 0..v.entities().len() {
+                                        v.set_visible(j, false, cx);
+                                    }
+                                });
+                            })),
+                    ),
+            );
+        }
         for (i, e) in viewer.entities().iter().enumerate() {
             let is_active = Some(i) == active;
             let visible = e.visible;
@@ -450,15 +728,26 @@ impl Workspace {
                 .items_center()
                 .gap_1()
                 .child(
+                    // The eye: click to show or hide, shift-click to show only this one.
                     Button::new(("vis", i))
-                        .label(if visible { "●" } else { "○" })
+                        .icon(if visible { IconName::Eye } else { IconName::EyeOff })
                         .ghost()
                         .xsmall()
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.viewer.update(cx, |v, cx| v.set_visible(i, !visible, cx));
+                        .tooltip(if visible { "Hide (shift-click: show only this)" } else { "Show (shift-click: show only this)" })
+                        .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                            let solo = event.modifiers().shift;
+                            this.viewer.update(cx, |v, cx| {
+                                if solo {
+                                    for j in 0..v.entities().len() {
+                                        v.set_visible(j, j == i, cx);
+                                    }
+                                } else {
+                                    v.set_visible(i, !visible, cx);
+                                }
+                            });
                         })),
                 )
-                .child(div().flex_1().child(
+                .child(div().flex_1().when(!visible, |d| d.opacity(0.45)).child(
                     list_row(("entity", i), e.name.clone(), is_active).on_click(cx.listener(move |this, _, _, cx| {
                         this.viewer.update(cx, |v, cx| v.set_active(i, cx));
                     })),
@@ -485,6 +774,23 @@ impl Workspace {
 
         if let Some(i) = active {
             let e = &viewer.entities()[i];
+            // A complex (protein and ligand together) cannot be docked until the ligand is its own entity.
+            let has_ligand = e.structure.residues.iter().any(|r| {
+                r.atoms.len() >= 4 && r.atoms.start < r.atoms.end && e.structure.kind(r.atoms.start as usize) == molecule::AtomKind::Ligand
+            });
+            let has_polymer = (0..e.structure.atoms.len()).any(|a| e.structure.kind(a) == molecule::AtomKind::Polymer);
+            if has_ligand && has_polymer {
+                scene = scene
+                    .child(
+                        Button::new("split-ligand")
+                            .label("Split ligand off")
+                            .xsmall()
+                            .on_click(cx.listener(move |this, _, _, cx| this.split_ligand(i, cx))),
+                    )
+                    .child(div().text_xs().text_color(muted()).child(
+                        "This entity holds a protein and a ligand. Split them to dock the ligand or measure against the protein.",
+                    ));
+            }
             let frames = e.structure.frame_count();
             if frames > 1 {
                 let frame = e.frame;
@@ -573,23 +879,22 @@ impl Workspace {
     }
 
     fn render_left(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let tab = self.config.left_tab;
         let mut panel = div()
             .id("left-drawer")
             .flex()
             .flex_col()
-            .gap_4()
-            .w(px(LEFT_WIDTH))
+            .gap_2()
+            .flex_1()
             .h_full()
-            .p_3()
-            .pt_10()
-            .overflow_y_scroll()
-            .bg(rgb(0x181a1f))
-            .border_r_1()
-            .border_color(rgb(0x2a2d35));
+            .min_w_0()
+            .p_2()
+            .overflow_y_scroll();
 
         // Project.
-        let mut project_section = section("Project");
+        let mut project_section = section_body();
         match &self.project {
+            _ if tab != LeftTab::Project => {}
             Some(project) => {
                 project_section = project_section
                     .child(div().text_base().font_weight(FontWeight::SEMIBOLD).child(project.name()))
@@ -605,7 +910,7 @@ impl Workspace {
                             .gap_1()
                             .child(
                                 Button::new("switch-project")
-                                    .label("Open…")
+                                    .label("Open project…")
                                     .small()
                                     .on_click(cx.listener(|this, _, _, cx| this.prompt_open_project(cx))),
                             )
@@ -660,9 +965,24 @@ impl Workspace {
                 }
             }
         }
-        panel = panel.child(project_section);
+        if tab == LeftTab::Project {
+            panel = panel.child(project_section);
+            panel = panel
+                .child(heading("Example"))
+                .child(div().text_xs().text_color(muted()).child(
+                    "HIV-1 protease with its inhibitor indinavir (1HSG), already split into receptor and ligand with a search box, \
+                     ready to dock. Creates a project if none is open.",
+                ))
+                .child(
+                    Button::new("load-example")
+                        .label("Load the example")
+                        .primary()
+                        .small()
+                        .on_click(cx.listener(|this, _, _, cx| this.load_example(cx))),
+                );
+        }
 
-        if let Some(project) = &self.project {
+        if let (LeftTab::Project, Some(project)) = (tab, &self.project) {
             // Structures: click adds to the scene, shift-click replaces it.
             let in_scene: Vec<Id> = self
                 .viewer
@@ -671,10 +991,14 @@ impl Workspace {
                 .iter()
                 .filter_map(|e| e.structure_id)
                 .collect();
-            let mut structures = section("Structures");
+            let mut structures = section_body();
             for entry in project.structures().unwrap_or_default() {
                 let id = entry.id;
                 let label = match &entry.source {
+                    _ if self.loading.contains_key(&id) => format!("{}  ·  reading…", entry.name),
+                    _ if self.load_queue.iter().any(|(q, _)| *q == id) => {
+                        format!("{}  ·  queued", entry.name)
+                    }
                     Some(src) if src.starts_with("rcsb:") => format!("{}  ·  PDB", entry.name),
                     Some(src) if src.starts_with("pose:") => format!("{}  ·  pose", entry.name),
                     _ => entry.name.clone(),
@@ -682,45 +1006,84 @@ impl Workspace {
                 structures = structures.child(
                     list_row(("structure", id as usize), label, in_scene.contains(&id)).on_click(cx.listener(
                         move |this, event: &ClickEvent, _, cx| {
-                            let result = if event.modifiers().shift {
-                                this.load_structure(id, cx)
-                            } else {
-                                this.add_structure_to_scene(id, cx).map(|_| ())
-                            };
-                            if let Err(e) = result {
-                                this.status = Some(format!("{e:#}"));
-                            }
+                            // Off the UI thread: a trajectory takes seconds to parse.
+                            this.load_structure_async(id, event.modifiers().shift, cx);
                         },
                     )),
                 );
             }
             structures = structures
                 .child(
-                    Button::new("add-structure")
-                        .label("Add file…")
-                        .small()
-                        .on_click(cx.listener(|this, _, _, cx| this.prompt_add_structure(cx))),
+                    div()
+                        .flex()
+                        .gap_1()
+                        .child(
+                            Button::new("add-structure")
+                                .label("Add files…")
+                                .small()
+                                .on_click(cx.listener(|this, _, _, cx| this.prompt_add_structure(cx))),
+                        )
+                        .child(
+                            Button::new("add-folder")
+                                .label("Add folder…")
+                                .small()
+                                .on_click(cx.listener(|this, _, _, cx| this.prompt_add_folder(cx))),
+                        ),
                 )
-                .child(div().text_xs().text_color(muted()).child("Click adds to the scene · Shift-click replaces it"));
-            panel = panel.child(structures);
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(muted())
+                        .child("Click a row to add it to the scene, shift-click to replace."),
+                );
+            panel = panel.child(heading("Structures")).child(structures);
         }
 
-        if !self.viewer.read(cx).entities().is_empty() {
-            let scene = self.render_scene_section(cx);
-            panel = panel.child(scene);
-        }
-
-        if self.project.is_some() {
-            let jobs = self.render_jobs_section(cx);
-            panel = panel.child(jobs);
-            if let Some(cavities) = self.render_cavities_section(cx) {
-                panel = panel.child(cavities);
+        if tab == LeftTab::Scene {
+            if self.viewer.read(cx).entities().is_empty() {
+                panel = panel.child(div().text_xs().text_color(muted()).child("The scene is empty. Add a structure from the Project tab."));
+            } else {
+                let scene = self.render_scene_section(cx);
+                panel = panel.child(scene);
             }
         }
 
-        if let Some(project) = &self.project {
+        if tab == LeftTab::Measure {
+            let measure = self.render_measure_tab(cx);
+            panel = panel.child(measure);
+        }
+
+        if tab == LeftTab::Jobs {
+            if self.project.is_none() {
+                panel = panel.child(div().text_xs().text_color(muted()).child("Open a project to run jobs."));
+            } else {
+                let jobs = self.render_jobs_section(cx);
+                panel = panel.child(jobs);
+            }
+        }
+
+        if tab == LeftTab::Results && self.project.is_some() {
+            let mut any = false;
+            if let Some(cavities) = self.render_cavities_section(cx) {
+                panel = panel.child(cavities);
+                any = true;
+            }
+            if let Some(ensemble) = self.render_ensemble_section(cx) {
+                panel = panel.child(ensemble);
+                any = true;
+            }
+            if let Some(docking) = self.render_docking_section(cx) {
+                panel = panel.child(docking);
+                any = true;
+            }
+            if !any {
+                panel = panel.child(div().text_xs().text_color(muted()).child("No results yet. Run a job from the Jobs tab."));
+            }
+        }
+
+        if let (LeftTab::Views, Some(project)) = (tab, &self.project) {
             // Views.
-            let mut views = section("Views");
+            let mut views = section_body();
             for view in project.views().unwrap_or_default() {
                 let id = view.id;
                 views = views.child(
@@ -759,7 +1122,7 @@ impl Workspace {
 
             let notes = project.notes().unwrap_or_default();
             if !notes.is_empty() {
-                let mut section_notes = section("Notes");
+                let mut section_notes = section_body();
                 for note in notes.iter().rev().take(8) {
                     section_notes = section_notes.child(
                         div()
@@ -769,14 +1132,14 @@ impl Workspace {
                             .child(div().text_xs().text_color(muted()).child(note.body.chars().take(140).collect::<String>())),
                     );
                 }
-                panel = panel.child(section_notes);
+                panel = panel.child(heading("Notes")).child(section_notes);
             }
         }
 
         // Representation of the active entity.
         let viewer = self.viewer.read(cx);
-        if viewer.structure().is_some() {
-            let mut scene = section("Representation (active)");
+        if tab == LeftTab::Scene && viewer.structure().is_some() {
+            let mut scene = section_body();
             let presets = [
                 ("default", "Default"),
                 ("cartoon+surface", "Cartoon + surface"),
@@ -843,27 +1206,76 @@ impl Workspace {
                         )
                     }),
             );
-            panel = panel.child(scene);
+            panel = panel.child(heading("Representation (active)")).child(scene);
         }
 
-        if let Some(status) = &self.status {
-            panel = panel.child(div().text_xs().text_color(rgb(0xc9ccd3)).child(status.clone()));
+        let status = self
+            .status
+            .clone()
+            .map(|s| div().p_2().border_t_1().border_color(rgb(0x2a2d35)).text_xs().text_color(rgb(0xc9ccd3)).child(s));
+
+        // Rail: one button per panel; a dot marks running jobs and results.
+        let running = !self.running.is_empty();
+        let has_results = self.cavities.is_some() || self.docking.is_some() || self.ensemble.is_some();
+        let mut rail = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .w(px(56.0))
+            .flex_none()
+            .h_full()
+            .p_1()
+            .bg(rgb(0x14161a))
+            .border_r_1()
+            .border_color(rgb(0x2a2d35));
+        for t in LeftTab::ALL {
+            let dot = match t {
+                LeftTab::Jobs if running => Some(0x8fb8de),
+                LeftTab::Results if has_results => Some(0x7fd18b),
+                _ => None,
+            };
+            rail = rail.child(
+                div()
+                    .id(SharedString::from(format!("rail-{}", t.label())))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .gap_1()
+                    .py_1()
+                    .rounded_md()
+                    .text_xs()
+                    .cursor_pointer()
+                    .when(t == tab, |d| d.bg(rgb(0x24324d)).text_color(rgb(0xe8eefc)))
+                    .when(t != tab, |d| d.hover(|s| s.bg(rgb(0x2c3039))))
+                    .child(t.label())
+                    .children(dot.map(|c| div().size(px(5.0)).rounded_full().bg(rgb(c))))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.config.left_tab = t;
+                        this.config.save();
+                        cx.notify();
+                    })),
+            );
         }
 
-        let viewer = self.viewer.read(cx);
-        panel.child(div().flex_1()).child(
-            section("Renderer")
-                .child(div().text_xs().text_color(muted()).child(viewer.adapter_name()))
-                .child(div().text_xs().text_color(muted()).child(format!(
-                    "{:.2} ms / frame · drag: rotate · right/shift-drag: pan · wheel: zoom · G/R: move/rotate active",
-                    viewer.last_render().as_secs_f64() * 1000.0
-                ))),
-        )
+        div()
+            .flex()
+            .size_full()
+            .bg(rgb(0x181a1f))
+            .border_r_1()
+            .border_color(rgb(0x2a2d35))
+            .child(rail)
+            .child(div().flex().flex_col().flex_1().min_w_0().h_full().child(panel).children(status))
     }
 }
 
 impl Render for Workspace {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Filter text set while a job finished: an input can only be written
+        // where a Window is in hand, which is here.
+        if let Some(text) = self.pending_filter_text.take() {
+            self.pocket_filter
+                .update(cx, |input, cx| input.set_value(text, window, cx));
+        }
         let toggle = |id: &'static str, label: &'static str| Button::new(id).label(label).ghost().xsmall();
         let toolbar = div()
             .absolute()
@@ -878,41 +1290,70 @@ impl Render for Workspace {
                     cx.notify();
                 }),
             ))
-            .child(toggle("toggle-right", if self.right_open { "Assistant ▶" } else { "◀ Assistant" }).on_click(
-                cx.listener(|this, _, _, cx| {
-                    this.right_open = !this.right_open;
-                    cx.notify();
-                }),
-            ));
+            .child(
+                div()
+                    .flex()
+                    .gap_1()
+                    .child(toggle("open-settings", "⚙ Settings").on_click(cx.listener(|this, _, window, cx| {
+                        this.open_settings(crate::settings::Tab::Llm, window, cx);
+                    })))
+                    .child(toggle("toggle-right", if self.right_open { "Assistant ▶" } else { "◀ Assistant" }).on_click(
+                        cx.listener(|this, _, _, cx| {
+                            this.right_open = !this.right_open;
+                            cx.notify();
+                        }),
+                    )),
+            );
 
-        let centre = div()
-            .relative()
-            .flex_1()
-            .h_full()
-            .child(self.viewer.clone())
-            .child(toolbar);
+        let left = resizable_panel()
+            .size(px(LEFT_WIDTH))
+            .size_range(px(SIDE_MIN)..px(SIDE_MAX))
+            .visible(self.left_open)
+            .child(
+                div()
+                    .size_full()
+                    .bg(rgb(0x181a1f))
+                    .border_r_1()
+                    .border_color(rgb(0x2a2d35))
+                    .child(self.render_left(cx)),
+            );
+
+        let centre = resizable_panel().child(
+            div()
+                .relative()
+                .size_full()
+                .child(self.viewer.clone())
+                .child(toolbar),
+        );
+
+        let right = resizable_panel()
+            .size(px(RIGHT_WIDTH))
+            .size_range(px(SIDE_MIN)..px(SIDE_MAX))
+            .visible(self.right_open)
+            .child(
+                div()
+                    .size_full()
+                    .bg(rgb(0x181a1f))
+                    .border_l_1()
+                    .border_color(rgb(0x2a2d35))
+                    .child(self.chat.clone()),
+            );
 
         div()
             .id("workspace")
-            .flex()
             .size_full()
             .bg(rgb(0x131418))
             .text_color(rgb(0xc9ccd3))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
                 this.add_files(paths.paths().to_vec(), cx);
             }))
-            .when(self.left_open, |el| el.child(self.render_left(cx)))
-            .child(centre)
-            .when(self.right_open, |el| {
-                el.child(
-                    div()
-                        .w(px(RIGHT_WIDTH))
-                        .h_full()
-                        .bg(rgb(0x181a1f))
-                        .border_l_1()
-                        .border_color(rgb(0x2a2d35))
-                        .child(self.chat.clone()),
-                )
-            })
+            .child(
+                h_resizable("columns")
+                    .with_state(&self.layout)
+                    .child(left)
+                    .child(centre)
+                    .child(right),
+            )
+            .children(gpui_component::Root::render_dialog_layer(window, cx))
     }
 }

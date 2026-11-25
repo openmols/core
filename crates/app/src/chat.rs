@@ -5,7 +5,7 @@ use crate::tools;
 use crate::workspace::Workspace;
 use futures::StreamExt;
 use gpui::{
-    AppContext, Context, Entity, IntoElement, ParentElement, Render, ScrollHandle, SharedString,
+    AppContext, Context, Entity, IntoElement, ParentElement, Render, ScrollHandle,
     Styled, Subscription, Task, WeakEntity, Window, div, prelude::*, px, rgb,
 };
 use gpui_component::{
@@ -23,14 +23,11 @@ const MAX_TOOL_ROUNDS: usize = 12;
 pub struct ChatPanel {
     workspace: WeakEntity<Workspace>,
     input: Entity<InputState>,
-    model_input: Entity<InputState>,
     messages: Vec<Message>,
     conversation: Option<Id>,
     streaming: String,
     busy: bool,
     error: Option<String>,
-    models: Vec<String>,
-    show_models: bool,
     scroll: ScrollHandle,
     task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -53,31 +50,21 @@ impl ChatPanel {
                 .auto_grow(2, 8)
                 .placeholder("Ask about the structure, or tell me what to show…  (Ctrl+Enter to send)")
         });
-        let model_input = cx.new(|cx| InputState::new(window, cx).placeholder("model id"));
         let subscriptions = vec![
             cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| {
                 if let InputEvent::PressEnter { secondary: true } = event {
                     this.send(window, cx);
                 }
             }),
-            cx.subscribe_in(&model_input, window, |this, input, event: &InputEvent, _, cx| {
-                if let InputEvent::Change = event {
-                    let model = input.read(cx).value().to_string();
-                    this.update_provider(cx, |p| p.model = model);
-                }
-            }),
         ];
         Self {
             workspace,
             input,
-            model_input,
             messages: Vec::new(),
             conversation: None,
             streaming: String::new(),
             busy: false,
             error: None,
-            models: Vec::new(),
-            show_models: false,
             scroll: ScrollHandle::new(),
             task: None,
             _subscriptions: subscriptions,
@@ -88,65 +75,6 @@ impl ChatPanel {
         self.workspace
             .upgrade()
             .and_then(|ws| ws.read(cx).config.provider().cloned())
-    }
-
-    fn update_provider(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut Provider)) {
-        if let Some(ws) = self.workspace.upgrade() {
-            ws.update(cx, |ws, _| {
-                let i = ws.config.active_provider;
-                if let Some(p) = ws.config.providers.get_mut(i) {
-                    f(p);
-                    ws.config.save();
-                }
-            });
-        }
-    }
-
-    fn select_provider(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(ws) = self.workspace.upgrade() {
-            ws.update(cx, |ws, _| {
-                ws.config.active_provider = index;
-                ws.config.save();
-            });
-        }
-        let model = self.provider(cx).map(|p| p.model).unwrap_or_default();
-        self.model_input.update(cx, |i, cx| i.set_value(model, window, cx));
-        self.models.clear();
-        self.show_models = false;
-        self.error = None;
-        cx.notify();
-    }
-
-    /// Show `model` in the model field (called by the workspace after config loads).
-    pub fn set_model_field(&mut self, model: String, window: &mut Window, cx: &mut Context<Self>) {
-        self.model_input.update(cx, |i, cx| i.set_value(model, window, cx));
-    }
-
-    fn fetch_models(&mut self, cx: &mut Context<Self>) {
-        let Some(provider) = self.provider(cx) else { return };
-        self.error = None;
-        cx.spawn(async move |this, cx| {
-            let result = blocking(move || llm::list_models(&provider)).await;
-            this.update(cx, |this, cx| {
-                match result {
-                    Ok(models) => {
-                        this.models = models;
-                        this.show_models = true;
-                    }
-                    Err(e) => this.error = Some(format!("{e:#}")),
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    fn pick_model(&mut self, model: String, window: &mut Window, cx: &mut Context<Self>) {
-        self.update_provider(cx, |p| p.model = model.clone());
-        self.model_input.update(cx, |i, cx| i.set_value(model, window, cx));
-        self.show_models = false;
-        cx.notify();
     }
 
     /// Show a stored conversation (the workspace reads it from the project).
@@ -293,7 +221,32 @@ impl ChatPanel {
                 }
                 for call in calls {
                     let args: Value = serde_json::from_str(&call.arguments).unwrap_or_else(|_| json!({}));
-                    let outcome: anyhow::Result<String> = if call.name == "detect_cavities" {
+                    // Tools that run a container finish asynchronously.
+                    let outcome: anyhow::Result<String> = if call.name == "run_frodock" {
+                        let started = workspace
+                            .update(cx, |ws, cx| ws.start_frodock_tool(&args, cx))
+                            .unwrap_or_else(|_| Err(anyhow::anyhow!("workspace closed")));
+                        match started {
+                            Ok(rx) => rx.await.unwrap_or_else(|_| Err(anyhow::anyhow!("job dropped"))),
+                            Err(e) => Err(e),
+                        }
+                    } else if call.name == "run_autodock" {
+                        let started = workspace
+                            .update(cx, |ws, cx| ws.start_autodock_tool(&args, cx))
+                            .unwrap_or_else(|_| Err(anyhow::anyhow!("workspace closed")));
+                        match started {
+                            Ok(rx) => rx.await.unwrap_or_else(|_| Err(anyhow::anyhow!("job dropped"))),
+                            Err(e) => Err(e),
+                        }
+                    } else if call.name == "detect_pockets_ensemble" {
+                        let started = workspace
+                            .update(cx, |ws, cx| ws.start_ensemble_tool(&args, cx))
+                            .unwrap_or_else(|_| Err(anyhow::anyhow!("workspace closed")));
+                        match started {
+                            Ok(rx) => rx.await.unwrap_or_else(|_| Err(anyhow::anyhow!("job dropped"))),
+                            Err(e) => Err(e),
+                        }
+                    } else if call.name == "detect_cavities" {
                         let started = workspace
                             .update(cx, |ws, cx| ws.start_kvfinder_tool(&args, cx))
                             .unwrap_or_else(|_| Err(anyhow::anyhow!("workspace closed")));
@@ -305,8 +258,10 @@ impl ChatPanel {
                         let id = args["pdb_id"].as_str().unwrap_or_default().to_string();
                         let download_id = id.clone();
                         match blocking(move || tools::download_pdb(&download_id)).await {
-                            Ok(bytes) => workspace
-                                .update(cx, |ws, cx| ws.add_downloaded_structure(&id, &bytes, cx))
+                            Ok((bytes, extension)) => workspace
+                                .update(cx, |ws, cx| {
+                                    ws.add_downloaded_structure(&id, &bytes, extension, cx)
+                                })
                                 .unwrap_or_else(|_| Err(anyhow::anyhow!("workspace closed"))),
                             Err(e) => Err(e),
                         }
@@ -387,26 +342,13 @@ impl ChatPanel {
 
 impl Render for ChatPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let (providers, active) = self
-            .workspace
-            .upgrade()
-            .map(|ws| {
-                let c = &ws.read(cx).config;
-                (c.providers.iter().map(|p| p.name.clone()).collect::<Vec<_>>(), c.active_provider)
+        let chip = self
+            .provider(cx)
+            .map(|p| {
+                if p.model.is_empty() { p.name } else { format!("{} · {}", p.name, p.model) }
             })
-            .unwrap_or_default();
-
-        let mut provider_row = div().flex().flex_wrap().gap_1();
-        for (i, name) in providers.into_iter().enumerate() {
-            let mut b = Button::new(SharedString::from(format!("provider-{i}")))
-                .label(name)
-                .small()
-                .on_click(cx.listener(move |this, _, window, cx| this.select_provider(i, window, cx)));
-            if i == active {
-                b = b.primary();
-            }
-            provider_row = provider_row.child(b);
-        }
+            .unwrap_or_else(|| "No provider — open Settings".into());
+        let workspace = self.workspace.clone();
 
         let header = div()
             .flex()
@@ -428,45 +370,16 @@ impl Render for ChatPanel {
                             .on_click(cx.listener(|this, _, _, cx| this.new_conversation(cx))),
                     ),
             )
-            .child(provider_row)
             .child(
-                div()
-                    .flex()
-                    .gap_1()
-                    .child(div().flex_1().child(Input::new(&self.model_input).small()))
-                    .child(
-                        Button::new("models")
-                            .label("Models")
-                            .small()
-                            .on_click(cx.listener(|this, _, _, cx| this.fetch_models(cx))),
-                    ),
-            )
-            .when(self.show_models, |el| {
-                let mut list = div()
-                    .id("model-list")
-                    .flex()
-                    .flex_col()
-                    .max_h(px(180.0))
-                    .overflow_y_scroll()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(rgb(0x343842));
-                for (i, m) in self.models.iter().enumerate() {
-                    let model = m.clone();
-                    list = list.child(
-                        div()
-                            .id(("model", i))
-                            .px_2()
-                            .py_1()
-                            .text_xs()
-                            .cursor_pointer()
-                            .hover(|s| s.bg(rgb(0x2c3039)))
-                            .child(m.clone())
-                            .on_click(cx.listener(move |this, _, window, cx| this.pick_model(model.clone(), window, cx))),
-                    );
-                }
-                el.child(list)
-            });
+                Button::new("provider-chip")
+                    .label(chip)
+                    .small()
+                    .on_click(move |_, window, cx| {
+                        workspace
+                            .update(cx, |ws, cx| ws.open_settings(crate::settings::Tab::Llm, window, cx))
+                            .ok();
+                    }),
+            );
 
         let mut transcript = div()
             .id("transcript")

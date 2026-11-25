@@ -8,6 +8,8 @@
 //!
 //! Everything here is blocking; callers run it on a background thread.
 
+pub mod autodock;
+pub mod frodock;
 pub mod kvfinder;
 
 use anyhow::{Context, Result, bail};
@@ -25,6 +27,9 @@ pub struct ToolImage {
     pub tag: &'static str,
     pub dockerfile: &'static str,
     pub gpu: bool,
+    /// Built from a folder the user supplies (software we must not download
+    /// or redistribute).
+    pub needs_context: bool,
     pub description: &'static str,
 }
 
@@ -34,10 +39,31 @@ pub const PYKVFINDER: ToolImage = ToolImage {
     tag: "openmols/pykvfinder:1",
     dockerfile: include_str!("../../../docker/pykvfinder/Dockerfile"),
     gpu: false,
+    needs_context: false,
     description: "Cavity detection and characterisation (GPL-3.0)",
 };
 
-pub const TOOLS: &[ToolImage] = &[PYKVFINDER];
+pub const FRODOCK: ToolImage = ToolImage {
+    tool: "frodock",
+    label: "FRODOCK",
+    tag: "openmols/frodock:1",
+    dockerfile: include_str!("../../../docker/frodock/Dockerfile"),
+    gpu: false,
+    needs_context: true,
+    description: "Protein-protein docking, built from your own copy (no licence published)",
+};
+
+pub const AUTODOCK: ToolImage = ToolImage {
+    tool: "autodock",
+    label: "AutoDock",
+    tag: "openmols/autodock:1",
+    dockerfile: include_str!("../../../docker/autodock/Dockerfile"),
+    gpu: false,
+    needs_context: false,
+    description: "AutoDock Vina and AutoDock4 docking, with covalent (flexible side-chain) docking (Apache-2.0 / GPL-2.0)",
+};
+
+pub const TOOLS: &[ToolImage] = &[PYKVFINDER, FRODOCK, AUTODOCK];
 
 pub fn tool(name: &str) -> Option<&'static ToolImage> {
     TOOLS.iter().find(|t| t.tool == name)
@@ -79,10 +105,30 @@ pub fn image_present(image: &ToolImage) -> bool {
 }
 
 /// `docker build` the image from its embedded Dockerfile, logging to `log`.
-pub fn build_image(image: &ToolImage, log: &Path) -> Result<()> {
+///
+/// `context` is the build context folder. Images that set `needs_context`
+/// require one: that is the copy of the tool you supply, which openmols never
+/// downloads. Other images build from the Dockerfile alone.
+pub fn build_image(image: &ToolImage, context: Option<&Path>, log: &Path) -> Result<()> {
+    if image.needs_context && context.is_none() {
+        bail!(
+            "{} is built from your own copy of the software — set its folder in the Tools panel first",
+            image.label
+        );
+    }
+    if let Some(dir) = context
+        && !dir.is_dir()
+    {
+        bail!("{} is not a folder", dir.display());
+    }
     let log_file = File::create(log).with_context(|| format!("creating {}", log.display()))?;
-    let mut child = docker()
-        .args(["build", "--progress", "plain", "-t", image.tag, "-"])
+    let mut cmd = docker();
+    cmd.args(["build", "--progress", "plain", "-t", image.tag, "-f", "-"]);
+    match context {
+        Some(dir) => cmd.arg(dir),
+        None => cmd.arg("-"),
+    };
+    let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(log_file.try_clone()?)
         .stderr(log_file)
@@ -182,6 +228,17 @@ mod tests {
             assert!(t.tag.starts_with("openmols/"));
         }
         assert_eq!(tool("pykvfinder"), Some(&PYKVFINDER));
+    }
+
+    #[test]
+    fn context_images_refuse_to_build_without_one() {
+        let log = std::env::temp_dir().join("openmols-frodock-guard.log");
+        let err = build_image(&FRODOCK, None, &log).unwrap_err().to_string();
+        assert!(err.contains("your own copy"), "{err}");
+        // A context that does not exist is reported too.
+        let missing = std::path::Path::new("definitely-not-a-folder-12345");
+        let err = build_image(&FRODOCK, Some(missing), &log).unwrap_err().to_string();
+        assert!(err.contains("not a folder"), "{err}");
     }
 
     /// Needs Docker and the image; run with `cargo test -p jobs -- --ignored`.

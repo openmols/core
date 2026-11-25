@@ -9,6 +9,8 @@
 //!
 //! Everything the panels and the LLM tools need is a public method here.
 
+use crate::annotations::{self, Annotation, AtomRef, MeasureMode};
+use std::hash::{Hash, Hasher};
 use glam::{Mat4, Quat, Vec3};
 use gpui::{
     Bounds, Context, Corners, DispatchPhase, EventEmitter, FocusHandle, IntoElement, KeyDownEvent,
@@ -37,6 +39,9 @@ pub struct ViewerEntity {
     pub transform: Mat4,
     pub visible: bool,
     pub frame: usize,
+    /// A translucent or wireframe surface around some of this entity's atoms.
+    pub volume: Option<render::Volume>,
+    volume_dirty: bool,
     undo: Vec<Mat4>,
     redo: Vec<Mat4>,
     geometry_dirty: bool,
@@ -46,6 +51,12 @@ impl ViewerEntity {
     /// Centre of the entity in world space (bounding-sphere centre).
     pub fn world_center(&self) -> Vec3 {
         self.transform.transform_point3(self.structure.bounding_sphere().0)
+    }
+
+    /// Radius of the enclosing sphere, Å. Rigid-body docking compares these
+    /// to decide which body is searched around the other.
+    pub fn radius(&self) -> f32 {
+        self.structure.bounding_sphere().1
     }
 }
 
@@ -81,6 +92,11 @@ pub struct ViewState {
     pub components: Vec<Component>,
     #[serde(default)]
     pub selection: Vec<usize>,
+    /// Measurements, contact sets and the docking box.
+    #[serde(default)]
+    pub annotations: Vec<Annotation>,
+    #[serde(default)]
+    pub annotation_hidden: Vec<bool>,
 }
 
 pub enum ViewerEvent {
@@ -116,6 +132,43 @@ struct Pose {
     axis: Option<(Axis, bool)>,
 }
 
+/// Dragging one of the docking box's handles.
+struct BoxDrag {
+    handle: u32,
+    center0: Vec3,
+    size0: Vec3,
+    /// Where on the handle's axis (or the camera plane) the drag began.
+    anchor: f32,
+    anchor_point: Vec3,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum MenuAction {
+    Measure(MeasureMode),
+    AddToMeasurement,
+    SelectResidue,
+    CenterHere,
+    BoxHere,
+    PlaceBox,
+    ToggleVolume,
+    ClearMeasurements,
+}
+
+/// The right-click menu, in viewport coordinates.
+struct Menu {
+    at: Point<Pixels>,
+    hit: Option<(usize, usize)>,
+    items: Vec<(String, MenuAction)>,
+    hover: Option<usize>,
+}
+
+const MENU_WIDTH: f32 = 250.0;
+const MENU_ROW: f32 = 24.0;
+const MENU_PAD: f32 = 4.0;
+/// Edge of a docking box made by clicking an atom, Å.
+const DEFAULT_BOX: f32 = 16.0;
+const MIN_BOX: f32 = 4.0;
+
 struct Drag {
     button: MouseButton,
     last: Point<Pixels>,
@@ -143,6 +196,20 @@ pub struct Viewer {
     hover: Option<(usize, usize, Point<Pixels>)>,
     pose: Option<Pose>,
     playing: Option<Task<()>>,
+    box_drag: Option<BoxDrag>,
+    /// The next click on an atom centres a new docking box there.
+    placing_box: bool,
+    menu: Option<Menu>,
+    /// Skip the mouse-up that ends a click already used by the menu.
+    swallow_up: bool,
+    overlay_next: Option<render::Overlay>,
+    overlay_fingerprint: u64,
+    annotations: Vec<Annotation>,
+    /// Per annotation: switched off with its eye. Missing entries mean shown.
+    annotation_hidden: Vec<bool>,
+    /// Click-to-measure: what a click builds, and the atoms picked so far.
+    measure: Option<MeasureMode>,
+    pending: Vec<AtomRef>,
 }
 
 impl Viewer {
@@ -165,6 +232,16 @@ impl Viewer {
             hover: None,
             pose: None,
             playing: None,
+            box_drag: None,
+            placing_box: false,
+            menu: None,
+            swallow_up: false,
+            overlay_next: None,
+            overlay_fingerprint: 0,
+            annotations: Vec::new(),
+            annotation_hidden: Vec::new(),
+            measure: None,
+            pending: Vec::new(),
         }
     }
 
@@ -261,6 +338,8 @@ impl Viewer {
             transform: Mat4::IDENTITY,
             visible: true,
             frame: 0,
+            volume: None,
+            volume_dirty: false,
             undo: Vec::new(),
             redo: Vec::new(),
             geometry_dirty: true,
@@ -618,6 +697,143 @@ impl Viewer {
         cx.notify();
     }
 
+    // ----------------------------------------------------------- annotations
+
+    pub fn annotations(&self) -> &[Annotation] {
+        &self.annotations
+    }
+
+    pub fn annotation_hidden(&self, index: usize) -> bool {
+        self.annotation_hidden.get(index).copied().unwrap_or(false)
+    }
+
+    /// Show or hide one measurement or object with its eye.
+    pub fn toggle_annotation_hidden(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.annotations.len() {
+            return;
+        }
+        if self.annotation_hidden.len() <= index {
+            self.annotation_hidden.resize(index + 1, false);
+        }
+        self.annotation_hidden[index] = !self.annotation_hidden[index];
+        self.dirty = true;
+        cx.notify();
+    }
+
+    pub fn set_annotation_hidden(&mut self, hidden: Vec<bool>, cx: &mut Context<Self>) {
+        self.annotation_hidden = hidden;
+        self.dirty = true;
+        cx.notify();
+    }
+
+
+    pub fn set_annotations(&mut self, annotations: Vec<Annotation>, cx: &mut Context<Self>) {
+        self.annotations = annotations;
+        self.annotation_hidden.clear();
+        self.dirty = true;
+        cx.notify();
+    }
+
+    pub fn add_annotation(&mut self, annotation: Annotation, cx: &mut Context<Self>) {
+        self.annotations.push(annotation);
+        self.dirty = true;
+        cx.notify();
+    }
+
+    pub fn remove_annotation(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index < self.annotations.len() {
+            self.annotations.remove(index);
+            if index < self.annotation_hidden.len() {
+                self.annotation_hidden.remove(index);
+            }
+            self.dirty = true;
+            cx.notify();
+        }
+    }
+
+    pub fn clear_annotations(&mut self, cx: &mut Context<Self>) {
+        self.annotations.clear();
+        self.annotation_hidden.clear();
+        self.pending.clear();
+        self.dirty = true;
+        cx.notify();
+    }
+
+    /// The docking box: the most recently added one.
+    pub fn dock_box(&self) -> Option<([f32; 3], [f32; 3])> {
+        self.annotations.iter().rev().find_map(|a| match a {
+            Annotation::DockBox { center, size } => Some((*center, *size)),
+            _ => None,
+        })
+    }
+
+    /// Replace any docking box with this one.
+    pub fn set_dock_box(&mut self, center: [f32; 3], size: [f32; 3], cx: &mut Context<Self>) {
+        let keep: Vec<bool> = self.annotations.iter().map(|a| !matches!(a, Annotation::DockBox { .. })).collect();
+        let mut kept = keep.iter();
+        self.annotation_hidden.retain(|_| kept.next().copied().unwrap_or(true));
+        self.annotations.retain(|a| !matches!(a, Annotation::DockBox { .. }));
+        self.annotations.push(Annotation::DockBox { center, size });
+        self.dirty = true;
+        cx.notify();
+    }
+
+    /// Wrap atoms of `entity` in a translucent surface (`None` removes it).
+    pub fn set_volume(&mut self, entity: usize, volume: Option<render::Volume>, cx: &mut Context<Self>) {
+        if let Some(e) = self.entities.get_mut(entity) {
+            e.volume = volume;
+            e.volume_dirty = true;
+            self.dirty = true;
+            cx.notify();
+        }
+    }
+
+    /// A translucent surface over the entity's selection, or all of it without water.
+    pub fn default_volume(&self, entity: usize) -> Option<render::Volume> {
+        let e = self.entities.get(entity)?;
+        let n = e.structure.atoms.len();
+        let selected: Vec<bool> = (0..n)
+            .map(|i| if e.selection.is_empty() { !e.structure.residue_of(i).is_water() } else { e.selection.contains(&i) })
+            .collect();
+        Some(render::Volume { selected, colors: vec![[110, 170, 255, 105]; n], wire: false })
+    }
+
+    pub fn placing_box(&self) -> bool {
+        self.placing_box
+    }
+
+    /// The next click on an atom centres the docking box on it.
+    pub fn set_placing_box(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.placing_box = on;
+        if on {
+            self.measure = None;
+            self.pending.clear();
+        }
+        self.dirty = true;
+        cx.notify();
+    }
+
+    /// A box of the default size centred on an atom.
+    fn box_at_atom(&mut self, entity: usize, atom: usize, cx: &mut Context<Self>) {
+        let Some(e) = self.entities.get(entity) else { return };
+        let Some(a) = e.structure.atoms.get(atom) else { return };
+        let center = e.transform.transform_point3(a.position);
+        self.set_dock_box(center.to_array(), [DEFAULT_BOX; 3], cx);
+        cx.emit(ViewerEvent::SceneChanged);
+    }
+
+    pub fn measure_mode(&self) -> Option<MeasureMode> {
+        self.measure
+    }
+
+    pub fn set_measure_mode(&mut self, mode: Option<MeasureMode>, cx: &mut Context<Self>) {
+        self.measure = mode;
+        self.pending.clear();
+        self.placing_box = false;
+        self.dirty = true;
+        cx.notify();
+    }
+
     pub fn set_camera(&mut self, camera: Camera, cx: &mut Context<Self>) {
         self.camera = camera;
         self.dirty = true;
@@ -643,6 +859,8 @@ impl Viewer {
             active: self.active,
             components: Vec::new(),
             selection: Vec::new(),
+            annotations: self.annotations.clone(),
+            annotation_hidden: self.annotation_hidden.clone(),
         }
     }
 
@@ -802,6 +1020,218 @@ impl Viewer {
         ))
     }
 
+
+    // ------------------------------------------------- box handles and menu
+
+    /// The ray through a window position: `(origin, direction)` in world space.
+    fn ray_at(&self, position: Point<Pixels>) -> Option<(Vec3, Vec3)> {
+        let local = position - self.viewport.origin;
+        let (w, h) = (f32::from(self.viewport.size.width), f32::from(self.viewport.size.height));
+        if w < 1.0 || h < 1.0 {
+            return None;
+        }
+        let ndc_x = 2.0 * f32::from(local.x) / w - 1.0;
+        let ndc_y = 1.0 - 2.0 * f32::from(local.y) / h;
+        let inverse = (self.camera.projection(w / h) * self.camera.view()).inverse();
+        let near = inverse.project_point3(Vec3::new(ndc_x, ndc_y, 0.0));
+        let far = inverse.project_point3(Vec3::new(ndc_x, ndc_y, 1.0));
+        let dir = (far - near).normalize_or_zero();
+        (dir != Vec3::ZERO).then_some((near, dir))
+    }
+
+    /// Where along the line `point + t·axis` the ray passes closest.
+    fn closest_on_axis(point: Vec3, axis: Vec3, origin: Vec3, dir: Vec3) -> Option<f32> {
+        let w0 = point - origin;
+        let (a, b, c) = (axis.dot(axis), axis.dot(dir), dir.dot(dir));
+        let (d, e) = (axis.dot(w0), dir.dot(w0));
+        let denom = a * c - b * b;
+        (denom.abs() > 1e-4).then(|| (b * e - c * d) / denom)
+    }
+
+    /// Where the ray meets the plane through `point` facing the camera.
+    fn on_view_plane(&self, point: Vec3, origin: Vec3, dir: Vec3) -> Option<Vec3> {
+        let normal = (self.camera.target - self.camera.eye()).normalize_or_zero();
+        let denom = normal.dot(dir);
+        (denom.abs() > 1e-4).then(|| origin + dir * (normal.dot(point - origin) / denom))
+    }
+
+    /// The pick under a window position, including overlay shapes.
+    fn pick_raw(&self, position: Point<Pixels>, scale: f32) -> Option<(usize, usize)> {
+        let renderer = self.renderer.as_ref().ok()?;
+        let local = position - self.viewport.origin;
+        let (x, y) = (f32::from(local.x) * scale, f32::from(local.y) * scale);
+        if x < 0.0 || y < 0.0 {
+            return None;
+        }
+        renderer.pick(x as u32, y as u32).ok().flatten()
+    }
+
+    /// Grab a box handle if one is under the cursor. True when the drag began.
+    fn grab_box_handle(&mut self, position: Point<Pixels>, scale: f32) -> bool {
+        let Some((center, size)) = self.dock_box() else { return false };
+        let Some((entity, handle)) = self.pick_raw(position, scale) else { return false };
+        if entity != render::OVERLAY_ENTITY || !(1..=annotations::HANDLE_CENTER_ID as usize).contains(&handle) {
+            return false;
+        }
+        let handle = handle as u32;
+        let Some((origin, dir)) = self.ray_at(position) else { return false };
+        let center = Vec3::from(center);
+        let (anchor, anchor_point) = match annotations::handle_axis(handle) {
+            Some((axis, _)) => {
+                let mut a = Vec3::ZERO;
+                a[axis] = 1.0;
+                (Self::closest_on_axis(center, a, origin, dir).unwrap_or(0.0), center)
+            }
+            None => (0.0, self.on_view_plane(center, origin, dir).unwrap_or(center)),
+        };
+        self.box_drag = Some(BoxDrag { handle, center0: center, size0: Vec3::from(size), anchor, anchor_point });
+        self.drag = None;
+        self.hover = None;
+        true
+    }
+
+    /// Move or resize the box while a handle is dragged.
+    fn drag_box(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(drag) = &self.box_drag else { return };
+        let Some((origin, dir)) = self.ray_at(position) else { return };
+        let (mut center, mut size) = (drag.center0, drag.size0);
+        match annotations::handle_axis(drag.handle) {
+            Some((axis, sign)) => {
+                let mut a = Vec3::ZERO;
+                a[axis] = 1.0;
+                let Some(t) = Self::closest_on_axis(drag.center0, a, origin, dir) else { return };
+                // Dragging a face moves it; the opposite face stays put.
+                let wanted = drag.size0[axis] + sign * (t - drag.anchor);
+                size[axis] = wanted.max(MIN_BOX);
+                center[axis] = drag.center0[axis] + sign * (size[axis] - drag.size0[axis]) * 0.5;
+            }
+            None => {
+                let Some(p) = self.on_view_plane(drag.center0, origin, dir) else { return };
+                center = drag.center0 + (p - drag.anchor_point);
+            }
+        }
+        if let Some(Annotation::DockBox { center: c, size: s }) =
+            self.annotations.iter_mut().rev().find(|a| matches!(a, Annotation::DockBox { .. }))
+        {
+            *c = center.to_array();
+            *s = size.to_array();
+        }
+        self.dirty = true;
+        cx.notify();
+    }
+
+    fn open_menu(&mut self, position: Point<Pixels>, hit: Option<(usize, usize)>, cx: &mut Context<Self>) {
+        let mut items: Vec<(String, MenuAction)> = Vec::new();
+        if hit.is_some() {
+            if let Some(mode) = self.measure.filter(|_| !self.pending.is_empty()) {
+                items.push((format!("Add this atom to the {}", mode.label().to_lowercase()), MenuAction::AddToMeasurement));
+            }
+            items.push(("Measure distance from this atom".into(), MenuAction::Measure(MeasureMode::Distance)));
+            items.push(("Measure angle from this atom".into(), MenuAction::Measure(MeasureMode::Angle)));
+            items.push(("Measure dihedral from this atom".into(), MenuAction::Measure(MeasureMode::Dihedral)));
+            items.push(("Select this residue".into(), MenuAction::SelectResidue));
+            items.push(("Centre the view here".into(), MenuAction::CenterHere));
+            items.push((format!("Docking box ({DEFAULT_BOX:.0} Å) around this atom"), MenuAction::BoxHere));
+            items.push(("Toggle volume surface of this entity".into(), MenuAction::ToggleVolume));
+        } else {
+            items.push(("Place docking box on an atom…".into(), MenuAction::PlaceBox));
+        }
+        if !self.annotations.is_empty() {
+            items.push(("Clear measurements and objects".into(), MenuAction::ClearMeasurements));
+        }
+        // Keep the menu inside the viewport.
+        let local = position - self.viewport.origin;
+        let (w, h) = (f32::from(self.viewport.size.width), f32::from(self.viewport.size.height));
+        let height = items.len() as f32 * MENU_ROW + 2.0 * MENU_PAD;
+        let at = gpui::point(
+            px(f32::from(local.x).min((w - MENU_WIDTH).max(0.0))),
+            px(f32::from(local.y).min((h - height).max(0.0))),
+        );
+        self.menu = Some(Menu { at, hit, items, hover: None });
+        self.hover = None;
+        cx.notify();
+    }
+
+    /// Row of the open menu under a window position.
+    fn menu_row(&self, position: Point<Pixels>) -> Option<usize> {
+        let menu = self.menu.as_ref()?;
+        let local = position - self.viewport.origin - menu.at;
+        let (x, y) = (f32::from(local.x), f32::from(local.y) - MENU_PAD);
+        (x >= 0.0 && x < MENU_WIDTH && y >= 0.0)
+            .then(|| (y / MENU_ROW) as usize)
+            .filter(|&row| row < menu.items.len())
+    }
+
+    /// Is a window position anywhere over the open menu?
+    fn over_menu(&self, position: Point<Pixels>) -> bool {
+        let Some(menu) = &self.menu else { return false };
+        let local = position - self.viewport.origin - menu.at;
+        let height = menu.items.len() as f32 * MENU_ROW + 2.0 * MENU_PAD;
+        (0.0..MENU_WIDTH).contains(&f32::from(local.x)) && (0.0..height).contains(&f32::from(local.y))
+    }
+
+    fn run_menu_action(&mut self, action: MenuAction, hit: Option<(usize, usize)>, cx: &mut Context<Self>) {
+        let atom_ref = |this: &Self| {
+            hit.and_then(|(e, a)| this.entities.get(e).map(|ent| AtomRef { entity: ent.name.clone(), atom: a }))
+        };
+        match action {
+            MenuAction::Measure(mode) => {
+                if let Some(first) = atom_ref(self) {
+                    self.measure = Some(mode);
+                    self.pending = vec![first];
+                    self.placing_box = false;
+                }
+            }
+            MenuAction::AddToMeasurement => {
+                if let (Some(mode), Some(atom)) = (self.measure, atom_ref(self)) {
+                    self.pending.push(atom);
+                    if self.pending.len() >= mode.atoms() {
+                        if let Some(a) = mode.build(&self.pending) {
+                            self.annotations.push(a);
+                        }
+                        self.pending.clear();
+                        cx.emit(ViewerEvent::SceneChanged);
+                    }
+                }
+            }
+            MenuAction::SelectResidue => {
+                if let Some((entity, atom)) = hit {
+                    let s = &self.entities[entity].structure;
+                    let r = &s.residues[s.atoms[atom].residue as usize];
+                    let atoms = (r.atoms.start as usize..r.atoms.end as usize).collect();
+                    self.active = Some(entity);
+                    self.set_entity_selection(entity, atoms, cx);
+                }
+            }
+            MenuAction::CenterHere => {
+                if let Some((entity, atom)) = hit {
+                    self.active = Some(entity);
+                    self.focus_atoms(&[atom], cx);
+                }
+            }
+            MenuAction::BoxHere => {
+                if let Some((entity, atom)) = hit {
+                    self.box_at_atom(entity, atom, cx);
+                }
+            }
+            MenuAction::PlaceBox => self.placing_box = true,
+            MenuAction::ToggleVolume => {
+                if let Some((entity, _)) = hit {
+                    let next = if self.entities[entity].volume.is_some() { None } else { self.default_volume(entity) };
+                    self.set_volume(entity, next, cx);
+                }
+            }
+            MenuAction::ClearMeasurements => self.clear_annotations(cx),
+        }
+        self.dirty = true;
+        cx.notify();
+    }
+
+    fn toggle_measure(&mut self, mode: MeasureMode, cx: &mut Context<Self>) {
+        let next = if self.measure == Some(mode) { None } else { Some(mode) };
+        self.set_measure_mode(next, cx);
+    }
+
     fn key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
         let m = event.keystroke.modifiers;
@@ -821,7 +1251,20 @@ impl Viewer {
             "y" if self.pose.is_some() => self.set_pose_axis(Axis::Y, cx),
             "z" if self.pose.is_some() => self.set_pose_axis(Axis::Z, cx),
             "enter" => self.confirm_pose(cx),
+            "escape" if self.menu.is_some() => {
+                self.menu = None;
+                cx.notify();
+            }
+            "escape" if self.placing_box => self.set_placing_box(false, cx),
+            "escape" if !self.pending.is_empty() => {
+                self.pending.clear();
+                cx.notify();
+            }
+            "escape" if self.pose.is_none() && self.measure.is_some() => self.set_measure_mode(None, cx),
             "escape" => self.cancel_pose(cx),
+            "m" => self.toggle_measure(MeasureMode::Distance, cx),
+            "a" => self.toggle_measure(MeasureMode::Angle, cx),
+            "d" => self.toggle_measure(MeasureMode::Dihedral, cx),
             "space" => self.toggle_playback(cx),
             "home" => self.reset_view(cx),
             _ => {}
@@ -836,6 +1279,7 @@ impl Viewer {
             renderer.truncate_entities(0);
             for e in &mut self.entities {
                 e.geometry_dirty = true;
+                e.volume_dirty = e.volume.is_some();
             }
             self.resync = false;
         }
@@ -855,6 +1299,11 @@ impl Viewer {
                 renderer.upload_entity(slot, &e.structure, &components, &e.selection);
                 e.geometry_dirty = false;
             }
+            // Surfaces are too slow to follow every frame of a playback.
+            if e.volume_dirty && !playing {
+                renderer.set_entity_volume(slot, &e.structure, e.volume.as_ref());
+                e.volume_dirty = false;
+            }
             renderer.set_entity_pose(slot, e.transform, e.visible);
         }
         renderer.truncate_entities(self.entities.len());
@@ -865,7 +1314,7 @@ impl Viewer {
         for image in self.retired.drain(..) {
             window.drop_image(image).ok();
         }
-        if self.entities.iter().any(|e| e.geometry_dirty) || self.resync {
+        if self.entities.iter().any(|e| e.geometry_dirty || e.volume_dirty) || self.resync {
             self.dirty = true;
         }
 
@@ -875,6 +1324,9 @@ impl Viewer {
 
         if self.dirty || self.frame.is_none() || self.frame_size != (width, height) {
             self.sync_renderer();
+            if let (Some(overlay), Ok(renderer)) = (self.overlay_next.take(), &mut self.renderer) {
+                renderer.set_overlay(&overlay);
+            }
             if let Ok(renderer) = &mut self.renderer {
                 match renderer.render(&self.camera, width, height) {
                     Ok(frame) => {
@@ -916,6 +1368,30 @@ impl Viewer {
 
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus);
+        if self.menu.is_some() {
+            if event.button == MouseButton::Left && self.over_menu(event.position) {
+                // The menu is drawn by this view and clicked here, so its rows need no handlers of their own.
+                if let (Some(row), Some(menu)) = (self.menu_row(event.position), self.menu.take()) {
+                    let action = menu.items[row].1;
+                    self.run_menu_action(action, menu.hit, cx);
+                } else {
+                    self.menu = None;
+                }
+                self.swallow_up = true;
+                cx.notify();
+                return;
+            }
+            self.menu = None;
+            cx.notify();
+        }
+        if event.button == MouseButton::Left
+            && self.pose.is_none()
+            && self.measure.is_none()
+            && !self.placing_box
+            && self.grab_box_handle(event.position, window.scale_factor())
+        {
+            return;
+        }
         if self.pose.is_some() {
             match event.button {
                 MouseButton::Left => self.confirm_pose(cx),
@@ -931,6 +1407,20 @@ impl Viewer {
     }
 
     fn mouse_move(&mut self, event: &MouseMoveEvent, scale: f32, cx: &mut Context<Self>) {
+        if self.box_drag.is_some() {
+            self.drag_box(event.position, cx);
+            return;
+        }
+        if self.menu.is_some() {
+            let row = self.menu_row(event.position);
+            if let Some(menu) = &mut self.menu
+                && menu.hover != row
+            {
+                menu.hover = row;
+                cx.notify();
+            }
+            return;
+        }
         if let Some(pose) = &mut self.pose {
             if pose.start_mouse.is_none() {
                 pose.start_mouse = Some(event.position);
@@ -964,9 +1454,48 @@ impl Viewer {
     }
 
     fn mouse_up(&mut self, event: &MouseUpEvent, scale: f32, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.swallow_up) {
+            self.drag = None;
+            return;
+        }
+        if self.box_drag.take().is_some() {
+            cx.emit(ViewerEvent::SceneChanged);
+            cx.notify();
+            return;
+        }
         let Some(drag) = self.drag.take() else { return };
+        if drag.button == MouseButton::Right && drag.travelled < CLICK_SLOP && self.pose.is_none() {
+            // A right click that did not pan opens the menu.
+            let hit = self.pick_at(event.position, scale);
+            self.open_menu(event.position, hit, cx);
+            return;
+        }
         if drag.button == MouseButton::Left && drag.travelled < CLICK_SLOP {
             let picked = self.pick_at(event.position, scale);
+            if self.placing_box {
+                if let Some((entity, atom)) = picked {
+                    self.box_at_atom(entity, atom, cx);
+                    self.placing_box = false;
+                    self.dirty = true;
+                    cx.notify();
+                }
+                return;
+            }
+            if let Some(mode) = self.measure {
+                if let Some((entity, atom)) = picked {
+                    let name = self.entities[entity].name.clone();
+                    self.pending.push(AtomRef { entity: name, atom });
+                    if self.pending.len() >= mode.atoms() {
+                        if let Some(a) = mode.build(&self.pending) {
+                            self.annotations.push(a);
+                        }
+                        self.pending.clear();
+                        cx.emit(ViewerEvent::SceneChanged);
+                    }
+                    cx.notify();
+                }
+                return;
+            }
             match picked {
                 Some((entity, atom)) => {
                     // Clicking activates the entity and selects the residue (Mol* style).
@@ -1055,6 +1584,137 @@ impl Render for Viewer {
                 .child(self.describe(entity, atom))
         });
 
+        // The 3D overlay (lines, box, handles) is uploaded with the next frame;
+        // only labels are laid over the image here.
+        let (vw, vh) = (f32::from(self.viewport.size.width), f32::from(self.viewport.size.height));
+        let unit = if vh > 1.0 { 2.0 * self.camera.distance * (self.camera.fov_y * 0.5).tan() / vh } else { 0.05 };
+        let edit_box = self.pose.is_none() && self.measure.is_none() && !self.placing_box;
+        let (overlay, anchors) =
+            annotations::shapes(&self.entities, &self.annotations, &self.annotation_hidden, &self.pending, unit, edit_box);
+        let fingerprint = {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            unit.to_bits().hash(&mut h);
+            for c in &overlay.cylinders {
+                (c.p0.map(f32::to_bits), c.p1.map(f32::to_bits), c.id).hash(&mut h);
+            }
+            for p in overlay.spheres.iter().chain(&overlay.handles) {
+                (p.center.map(f32::to_bits), p.radius.to_bits(), p.id).hash(&mut h);
+            }
+            for f in &overlay.faces {
+                f.corners.map(|c| c.map(f32::to_bits)).hash(&mut h);
+            }
+            h.finish()
+        };
+        if fingerprint != self.overlay_fingerprint {
+            self.overlay_fingerprint = fingerprint;
+            self.overlay_next = Some(overlay);
+            self.dirty = true;
+        }
+        let labels: Vec<_> = if vw > 1.0 && vh > 1.0 {
+            let projector = annotations::Projector {
+                matrix: self.camera.projection(vw / vh) * self.camera.view(),
+                width: vw,
+                height: vh,
+            };
+            anchors
+                .into_iter()
+                .filter_map(|l| {
+                    let (x, y) = projector.point(l.at)?;
+                    Some(
+                        div()
+                            .absolute()
+                            .left(px(x + 6.0))
+                            .top(px(y - 8.0))
+                            .px_1()
+                            .rounded_sm()
+                            .bg(gpui::rgba(0x131418cc))
+                            .text_xs()
+                            .text_color(rgb(l.color))
+                            .child(l.text),
+                    )
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let menu = self.menu.as_ref().map(|m| {
+            let rows: Vec<_> = m
+                .items
+                .iter()
+                .enumerate()
+                .map(|(i, (label, _))| {
+                    div()
+                        .h(px(MENU_ROW))
+                        .px_2()
+                        .flex()
+                        .items_center()
+                        .text_xs()
+                        .text_color(rgb(0xe6e8ec))
+                        .when(m.hover == Some(i), |d| d.bg(rgb(0x2f4a7a)))
+                        .child(label.clone())
+                })
+                .collect();
+            div()
+                .absolute()
+                .left(m.at.x)
+                .top(m.at.y)
+                .w(px(MENU_WIDTH))
+                .py(px(MENU_PAD))
+                .rounded_md()
+                .bg(rgb(0x20232b))
+                .border_1()
+                .border_color(rgb(0x3a3f4b))
+                .children(rows)
+        });
+        let measure_hint = self.measure.map(|mode| {
+            div()
+                .absolute()
+                .top_10()
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .px_3()
+                        .py_1()
+                        .rounded_md()
+                        .bg(rgb(0x3a3320))
+                        .border_1()
+                        .border_color(rgb(0xf2c14e))
+                        .text_sm()
+                        .text_color(rgb(0xfbe8b0))
+                        .child(format!(
+                            "{}: click atom {} of {} · Esc cancels",
+                            mode.label(),
+                            self.pending.len() + 1,
+                            mode.atoms()
+                        )),
+                )
+        });
+
+        let place_hint = self.placing_box.then(|| {
+            div()
+                .absolute()
+                .top_10()
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .px_3()
+                        .py_1()
+                        .rounded_md()
+                        .bg(rgb(0x1d3350))
+                        .border_1()
+                        .border_color(rgb(0x5fb4ff))
+                        .text_sm()
+                        .text_color(rgb(0xd6e8ff))
+                        .child("Click an atom to centre the docking box on it · then drag its handles · Esc cancels"),
+                )
+        });
+
         let badge = self.pose_badge().map(|text| {
             div()
                 .absolute()
@@ -1086,6 +1746,10 @@ impl Render for Viewer {
             .overflow_hidden()
             .bg(rgb(0x131418))
             .child(viewport)
+            .children(labels)
+            .children(measure_hint)
+            .children(place_hint)
+            .children(menu)
             .children(tooltip)
             .children(badge)
             .when(self.entities.is_empty(), |el| {

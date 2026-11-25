@@ -44,7 +44,9 @@ pub fn specs() -> Vec<ToolSpec> {
     // Every tool that acts on structures can target a specific entity.
     const SCENE_LEVEL: &[&str] = &[
         "get_project_overview", "fetch_pdb", "load_structure", "add_structure_to_scene",
-        "list_entities", "align_entities", "add_note", "save_view", "load_view", "reset_view",
+        "list_entities", "align_entities", "add_note", "save_view", "load_view", "reset_view", "clear_scene",
+        "run_frodock", "run_autodock", "list_docking_poses", "list_ensemble_pockets",
+        "cavity_statistics", "refilter_ensemble_pockets",
     ];
     for spec in &mut specs {
         if SCENE_LEVEL.contains(&spec.name.as_str()) {
@@ -73,14 +75,15 @@ fn base_specs() -> Vec<ToolSpec> {
     vec![
         spec("get_project_overview", "List the open project's structures, saved views and notes, and which structure is loaded.", no_args()),
         spec("get_structure_info", "Summarise the loaded structure: chains, residue counts, ligands, secondary structure, current representations and selection.", no_args()),
-        spec("fetch_pdb", "Download a structure from the RCSB PDB by 4-character id, add it to the project and load it.",
+        spec("fetch_pdb", "Download a structure from the RCSB PDB by 4-character id, add it to the project and load it. PDB format is used where available, falling back to mmCIF only for entries too large for it.",
             json!({ "type": "object", "properties": { "pdb_id": { "type": "string" } }, "required": ["pdb_id"] })),
         spec("load_structure", "Replace the whole scene with one project structure.",
             json!({ "type": "object", "properties": { "structure_id": { "type": "integer" } }, "required": ["structure_id"] })),
         spec("add_structure_to_scene", "Add a project structure to the scene as a new entity (keeps the others) and make it active.",
             json!({ "type": "object", "properties": { "structure_id": { "type": "integer" } }, "required": ["structure_id"] })),
         spec("list_entities", "List the entities in the scene with their index, structure, frame count and whether they are moved.", no_args()),
-        spec("remove_entity", "Remove an entity from the scene.", no_args()),
+        spec("remove_entity", "Remove one entity from the scene (the active one unless `entity` says otherwise).", no_args()),
+        spec("clear_scene", "Remove every entity from the scene, leaving it empty. The project's structures are untouched.", no_args()),
         spec("align_entities", "Superpose the mobile entity onto the target (sequence alignment + Cα Kabsch fit with outlier rejection, like PyMOL align). Returns RMSD.",
             json!({ "type": "object", "properties": {
                 "mobile": { "type": "string", "description": "Entity name or index to move" },
@@ -128,6 +131,77 @@ fn base_specs() -> Vec<ToolSpec> {
                 "volume_cutoff": { "type": "number", "description": "Minimum cavity volume in Å³ (default 5)" }
             } })),
         spec("list_cavities", "Return the results of the latest cavity detection in this project.", no_args()),
+        spec("measure", "Measure and show a distance (2 atoms), angle (3, vertex in the middle) or dihedral (4) between named atoms, possibly in different entities. Returns the value in angstrom or degrees.",
+            json!({ "type": "object", "properties": {
+                "kind": { "type": "string", "enum": ["distance", "angle", "dihedral"] },
+                "atoms": { "type": "array", "items": { "type": "object", "properties": { "entity": { "type": "string", "description": "Entity name; omit for the active one" }, "chain": { "type": "string" }, "residue": { "type": "integer" }, "atom": { "type": "string", "description": "Atom name, e.g. CA or OD2" } }, "required": ["residue", "atom"] } }
+            }, "required": ["kind", "atoms"] })),
+        spec("find_contacts", "Find and draw contacts between two entities (e.g. a ligand and its receptor): H-bond candidates (N/O within 3.5 A), other contacts and clashes. Returns counts and the polar/clash pairs by residue.",
+            json!({ "type": "object", "properties": {
+                "entity": { "type": "string" }, "against": { "type": "string" },
+                "cutoff": { "type": "number", "description": "Distance in A, default 4" },
+                "use_selection": { "type": "boolean", "description": "Only the selected atoms of `entity`" }
+            }, "required": ["entity", "against"] })),
+        spec("set_dock_box", "Place the docking search box (the grid for Vina/AutoDock). Give center and size, or let it wrap the selection / ligand of an entity with padding.",
+            json!({ "type": "object", "properties": {
+                "center": { "type": "array", "items": { "type": "number" } }, "size": { "type": "array", "items": { "type": "number" } },
+                "entity": { "type": "string" }, "around": { "type": "string", "enum": ["selection", "ligand"] },
+                "padding": { "type": "number", "description": "Angstrom added on each side (default 5)" }
+            } })),
+        spec("list_annotations", "List the measurements, contact sets and boxes in the scene.", no_args()),
+        spec("clear_annotations", "Remove all measurements, contact sets and boxes.", no_args()),
+        spec("detect_pockets_ensemble", "Detect pockets across EVERY frame of an ensemble or trajectory with pyKVFinder, then merge cavities that share lining residues into consensus pockets scored by persistence (the fraction of frames they appear in). Use this instead of detect_cavities when the entity has more than one frame. Runs in Docker; roughly a second per frame. Defaults reproduce the AR-V7 protocol: >5 lining residues, hydropathy <= 0, area 80-2480 A^2, volume >= 120 A^3, merged at 60% shared residues.",
+            json!({ "type": "object", "properties": {
+                "stride": { "type": "integer", "description": "Analyse every Nth frame (default 1 = all)" },
+                "residue_overlap": { "type": "number", "description": "Fraction of lining residues two cavities must share to count as the same pocket (default 0.6)" },
+                "replace_defaults": { "type": "boolean", "description": "Start from no filters instead of the AR-V7 defaults" },
+                "filters": {
+                    "type": "array",
+                    "description": "Filters to add, change or remove. Each sets a min and/or max on one metric; giving a metric that already has a filter replaces it.",
+                    "items": { "type": "object", "properties": {
+                        "metric": { "type": "string", "description": "volume, area, max_depth, avg_depth, hydropathy, residues, persistence, or a per-residue property averaged over the lining residues: rmsf (from the ensemble's own motion, fitted first) or bfactor" },
+                        "min": { "type": "number" },
+                        "max": { "type": "number" },
+                        "remove": { "type": "boolean", "description": "Drop the default filter on this metric" }
+                    }, "required": ["metric"] }
+                }
+            } })),
+        spec("list_ensemble_pockets", "Return the consensus pockets from the latest ensemble pocket run, with persistence and lining residues.", no_args()),
+        spec("cavity_statistics", "Statistics over EVERY cavity pyKVFinder found in the latest ensemble run, before filtering: how many per frame, and the range, median and percentiles of each metric, plus how many cavities each filter rule keeps on its own. Use this to choose thresholds from the data, or to explain why a filter kept too few pockets.", no_args()),
+        spec("refilter_ensemble_pockets", "Apply different filters to the cavities the latest ensemble run already found, without running detection again (fast: no container, no re-detection). Every cavity is kept on disk, so any threshold can be tried. Omit `filters` with replace_defaults to keep everything unfiltered.",
+            json!({ "type": "object", "properties": {
+                "residue_overlap": { "type": "number", "description": "Fraction of lining residues two cavities must share to count as the same pocket (default keeps the current value)" },
+                "replace_defaults": { "type": "boolean", "description": "Start from no filters at all instead of the current ones" },
+                "filters": {
+                    "type": "array",
+                    "description": "Filters to add, change or remove, as in detect_pockets_ensemble.",
+                    "items": { "type": "object", "properties": {
+                        "metric": { "type": "string", "description": "volume, area, max_depth, avg_depth, hydropathy, residues, persistence, or a per-residue property such as rmsf or bfactor" },
+                        "min": { "type": "number" },
+                        "max": { "type": "number" },
+                        "remove": { "type": "boolean" }
+                    }, "required": ["metric"] }
+                }
+            } })),
+        spec("run_frodock", "Dock one structure onto another with FRODOCK (protein-protein docking; runs in Docker and can take many minutes). Both are used in their current scene positions, so pose them first if you want a local search. The top poses load as frames of one entity.",
+            json!({ "type": "object", "properties": {
+                "receptor": { "type": "string", "description": "Entity name or index to keep fixed (the larger one)" },
+                "ligand": { "type": "string", "description": "Entity name or index to dock (the smaller one)" },
+                "interaction": { "type": "string", "enum": ["other", "antibody", "enzyme"], "description": "Electrostatic profile (default other)" },
+                "top_n": { "type": "integer", "description": "How many clustered poses to keep (default 10)" },
+                "around_ligand": { "type": "boolean", "description": "Local docking: search only around the ligand's current position" }
+            }, "required": ["receptor", "ligand"] })),
+        spec("run_autodock", "Dock a small molecule into a receptor with AutoDock Vina or AutoDock4 (Docker; minutes). Uses the docking box if one is set (set_dock_box), else a box around the ligand. With covalent_residue (Cys, Lys, Ser or Tyr, e.g. A:CYS:481) the ligand is bonded to that residue through its warhead and docked as a flexible side chain; covalent poses carry no energy. Warheads: acrylamide, vinylsulfonamide and chloroacetamide (Cys, Lys), sulfonylfluoride (Lys, Ser, Tyr), aldehyde (Lys, as an imine). Poses load as frames of one entity, best first, and are listed by list_docking_poses.",
+            json!({ "type": "object", "properties": {
+                "receptor": { "type": "string", "description": "Entity name or index of the protein" },
+                "ligand": { "type": "string", "description": "Entity name or index of the small molecule" },
+                "engine": { "type": "string", "enum": ["vina", "autodock4"], "description": "Default: the last one used" },
+                "exhaustiveness": { "type": "integer", "description": "Vina search effort (default 8; 32 for a careful run)" },
+                "num_modes": { "type": "integer", "description": "Poses to keep (Vina) or independent runs (AutoDock4)" },
+                "covalent_residue": { "type": "string", "description": "Receptor Cys/Lys/Ser/Tyr as chain:NAME:number, e.g. A:CYS:481 or A:SER:195, for covalent docking" },
+                "warhead": { "type": "string", "enum": ["acrylamide", "chloroacetamide", "vinylsulfonamide", "sulfonylfluoride", "aldehyde"], "description": "Reactive group on the ligand (covalent only); must be able to bond to the residue" }
+            }, "required": ["receptor", "ligand"] })),
+        spec("list_docking_poses", "Return the poses from the latest docking run (FRODOCK, Vina or AutoDock4) in this project.", no_args()),
         spec("add_note", "Add a note to the project (findings, hypotheses, next steps).",
             json!({ "type": "object", "properties": { "title": { "type": "string" }, "body": { "type": "string" } }, "required": ["title", "body"] })),
     ]
@@ -261,11 +335,22 @@ impl Workspace {
     /// Execute a (non-network) tool on the UI thread.
     pub fn run_tool(&mut self, name: &str, args: &Value, cx: &mut Context<Self>) -> Result<String> {
         let viewer = self.viewer.clone();
-        if let Some(key) = entity_arg(&args["entity"]) {
+        // "all" targets the whole scene rather than one entity.
+        let all_entities = entity_arg(&args["entity"])
+            .is_some_and(|k| matches!(k.to_lowercase().as_str(), "all" | "*" | "everything" | "scene"));
+        if name == "clear_scene" || (name == "remove_entity" && all_entities) {
+            let count = viewer.read(cx).entities().len();
+            viewer.update(cx, |v, cx| v.clear(cx));
+            return Ok(match count {
+                0 => "the scene was already empty".to_string(),
+                n => format!("cleared the scene ({n} entit{} removed)", if n == 1 { "y" } else { "ies" }),
+            });
+        }
+        if let Some(key) = entity_arg(&args["entity"]).filter(|_| !all_entities) {
             let index = viewer
                 .read(cx)
                 .find_entity(&key)
-                .with_context(|| format!("no entity '{key}' in the scene"))?;
+                .with_context(|| format!("no entity '{key}' in the scene (use list_entities to see them)"))?;
             viewer.update(cx, |v, cx| v.set_active(index, cx));
         }
         let structure = viewer.read(cx).structure().cloned();
@@ -330,9 +415,13 @@ impl Workspace {
                 Ok(out)
             }
             "remove_entity" => {
-                let index = viewer.read(cx).active_index().context("the scene is empty")?;
+                let (index, label) = {
+                    let v = viewer.read(cx);
+                    let i = v.active_index().context("the scene is empty")?;
+                    (i, v.entities()[i].name.clone())
+                };
                 viewer.update(cx, |v, cx| v.remove_entity(index, cx));
-                Ok(format!("entity {index} removed"))
+                Ok(format!("removed {label} from the scene"))
             }
             "align_entities" => {
                 let v = viewer.read(cx);
@@ -403,6 +492,18 @@ impl Workspace {
                 Ok(format!("frames fitted onto frame 1; mean Cα RMSD {rmsd:.2} Å"))
             }
             "list_cavities" => Ok(self.cavity_summary()),
+            "measure" => self.tool_measure(args, cx),
+            "find_contacts" => self.tool_contacts(args, cx),
+            "set_dock_box" => self.tool_dock_box(args, cx),
+            "list_annotations" => Ok(self.tool_list_annotations(cx)),
+            "clear_annotations" => {
+                viewer.update(cx, |v, cx| v.clear_annotations(cx));
+                Ok("cleared".into())
+            }
+            "list_ensemble_pockets" => Ok(self.ensemble_summary()),
+            "cavity_statistics" => Ok(self.cavity_statistics()),
+            "refilter_ensemble_pockets" => self.refilter_ensemble_tool(args, cx),
+            "list_docking_poses" => Ok(self.docking_summary()),
             "set_representations" => {
                 need_structure()?;
                 let components = args["components"]
@@ -563,11 +664,18 @@ impl Workspace {
     }
 
     /// Apply a downloaded PDB entry (second half of `fetch_pdb`).
-    pub fn add_downloaded_structure(&mut self, pdb_id: &str, bytes: &[u8], cx: &mut Context<Self>) -> Result<String> {
+    /// `extension` is whichever format RCSB served, normally `pdb`.
+    pub fn add_downloaded_structure(
+        &mut self,
+        pdb_id: &str,
+        bytes: &[u8],
+        extension: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<String> {
         let project = self.project.as_ref().context("no project is open — ask the user to create one first")?;
         let id = pdb_id.to_uppercase();
         let entry = project.add_structure_bytes(
-            &format!("{}.cif", id.to_lowercase()),
+            &format!("{}.{extension}", id.to_lowercase()),
             bytes,
             &id,
             Some(&format!("rcsb:{id}")),
@@ -583,15 +691,44 @@ impl Workspace {
     }
 }
 
-/// Blocking download of an mmCIF entry from RCSB (run off the UI thread).
-pub fn download_pdb(pdb_id: &str) -> Result<Vec<u8>> {
+/// Blocking download of an entry from RCSB (run off the UI thread).
+///
+/// PDB format is preferred, since that is what most tools and users expect.
+/// Very large entries (big complexes, ribosomes) are only published as
+/// mmCIF, so that is the fallback. Returns the bytes and the extension used.
+pub fn download_pdb(pdb_id: &str) -> Result<(Vec<u8>, &'static str)> {
     let id = pdb_id.trim();
     if id.len() != 4 || !id.chars().all(|c| c.is_ascii_alphanumeric()) {
         bail!("'{id}' is not a valid 4-character PDB id");
     }
-    let url = format!("https://files.rcsb.org/download/{}.cif", id.to_uppercase());
-    let mut response = ureq::get(&url).call().with_context(|| format!("downloading {url}"))?;
-    Ok(response.body_mut().with_config().limit(200 * 1024 * 1024).read_to_vec()?)
+    let id = id.to_uppercase();
+    // A missing .pdb is a 404 we handle, not a transport failure, so don't
+    // let ureq turn the status into an error.
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_connect(Some(std::time::Duration::from_secs(15)))
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let mut last_error = String::new();
+    for extension in ["pdb", "cif"] {
+        let url = format!("https://files.rcsb.org/download/{id}.{extension}");
+        let response = agent
+            .get(&url)
+            .call()
+            .with_context(|| format!("downloading {url}"))?;
+        let status = response.status();
+        if status.is_success() {
+            let bytes = response
+                .into_body()
+                .with_config()
+                .limit(200 * 1024 * 1024)
+                .read_to_vec()?;
+            return Ok((bytes, extension));
+        }
+        // 404 on .pdb means the entry is too large for the format.
+        last_error = format!("{url} returned {status}");
+    }
+    bail!("could not download {id} from RCSB ({last_error})")
 }
 
 /// Entity argument as a string, accepting numbers too.
@@ -605,4 +742,26 @@ fn entity_arg(v: &Value) -> Option<String> {
 
 pub fn view_state_json(state: &ViewState) -> Value {
     serde_json::to_value(state).unwrap_or(Value::Null)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Hits RCSB; run with `cargo test -p app -- --ignored`.
+    #[test]
+    #[ignore]
+    fn prefers_pdb_and_falls_back_to_cif() {
+        // A normal entry is served as PDB.
+        let (bytes, extension) = download_pdb("1hsg").unwrap();
+        assert_eq!(extension, "pdb");
+        assert!(bytes.starts_with(b"HEADER"), "expected a PDB header");
+
+        // A ribosome is too large for the PDB format, so mmCIF is used.
+        let (bytes, extension) = download_pdb("4V6X").unwrap();
+        assert_eq!(extension, "cif");
+        assert!(bytes.starts_with(b"data_"), "expected an mmCIF file");
+
+        assert!(download_pdb("nope!").is_err());
+    }
 }

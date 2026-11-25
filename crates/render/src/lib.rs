@@ -27,6 +27,59 @@ const PICK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg32Uint;
 const ENTITY_STRIDE: u64 = 256;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
+/// Entity index reported by [`Renderer::pick`] for pixels covered by the
+/// overlay; the atom index is then the `id` the overlay shape was given.
+pub const OVERLAY_ENTITY: usize = 0x00FF_0000;
+
+/// A world-space cylinder in the overlay (measurement lines, box edges).
+#[derive(Clone, Copy, Debug)]
+pub struct OverlayCylinder {
+    pub p0: [f32; 3],
+    pub p1: [f32; 3],
+    pub radius: f32,
+    pub color: [u8; 4],
+    /// Reported by `pick` (0 = nothing in particular).
+    pub id: u32,
+}
+
+/// A world-space sphere in the overlay (handles, markers).
+#[derive(Clone, Copy, Debug)]
+pub struct OverlaySphere {
+    pub center: [f32; 3],
+    pub radius: f32,
+    pub color: [u8; 4],
+    pub id: u32,
+}
+
+/// A translucent quad in the overlay (box faces); `color` carries the alpha.
+#[derive(Clone, Copy, Debug)]
+pub struct OverlayFace {
+    pub corners: [[f32; 3]; 4],
+    pub color: [u8; 4],
+}
+
+/// Everything drawn over the molecules, in world space and depth-correct.
+#[derive(Clone, Debug, Default)]
+pub struct Overlay {
+    pub cylinders: Vec<OverlayCylinder>,
+    pub spheres: Vec<OverlaySphere>,
+    /// Spheres drawn on top of everything (and pickable through the molecule):
+    /// drag handles.
+    pub handles: Vec<OverlaySphere>,
+    pub faces: Vec<OverlayFace>,
+}
+
+/// A translucent (or wireframe) surface around some of an entity's atoms.
+#[derive(Clone, Debug)]
+pub struct Volume {
+    /// Atoms the surface wraps (same length as the structure's atoms).
+    pub selected: Vec<bool>,
+    /// RGBA per atom; the alpha is the surface's opacity there.
+    pub colors: Vec<[u8; 4]>,
+    /// Draw the mesh edges as well.
+    pub wire: bool,
+}
+
 /// Background colour (sRGB, 0..1).
 pub const BACKGROUND: [f32; 3] = [0.075, 0.08, 0.095];
 
@@ -67,7 +120,26 @@ struct RenderTarget {
     padded_row: u32,
 }
 
+struct VolumeBuffers {
+    vertices: wgpu::Buffer,
+    indices: wgpu::Buffer,
+    index_count: u32,
+    wire: Option<(wgpu::Buffer, u32)>,
+}
+
+struct OverlayBuffers {
+    cylinders: Option<wgpu::Buffer>,
+    cylinder_count: u32,
+    spheres: Option<wgpu::Buffer>,
+    sphere_count: u32,
+    faces: Option<(wgpu::Buffer, wgpu::Buffer)>,
+    face_index_count: u32,
+    handles: Option<wgpu::Buffer>,
+    handle_count: u32,
+}
+
 struct EntityBuffers {
+    volume: Option<VolumeBuffers>,
     spheres: Option<wgpu::Buffer>,
     sphere_count: u32,
     cylinders: Option<wgpu::Buffer>,
@@ -85,6 +157,14 @@ pub struct Renderer {
     sphere_pipeline: wgpu::RenderPipeline,
     cylinder_pipeline: wgpu::RenderPipeline,
     mesh_pipeline: wgpu::RenderPipeline,
+    translucent_pipeline: wgpu::RenderPipeline,
+    wire_pipeline: wgpu::RenderPipeline,
+    ghost_pipeline: wgpu::RenderPipeline,
+    gizmo_pipeline: wgpu::RenderPipeline,
+    overlay: Option<OverlayBuffers>,
+    #[allow(dead_code)] // kept alive for the bind group
+    overlay_uniform: wgpu::Buffer,
+    overlay_bind_group: wgpu::BindGroup,
     globals: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     entity_layout: wgpu::BindGroupLayout,
@@ -243,6 +323,158 @@ impl Renderer {
             &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Unorm8x4, 3 => Uint32],
         );
 
+        // Translucent surfaces and wireframes: blended, no depth writes, and
+        // the pick target masked so they cannot be clicked.
+        let make_blended = |label: &str, topology: wgpu::PrimitiveTopology| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_mesh_alpha"),
+                    compilation_options: Default::default(),
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<MeshVertex>() as u64,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Unorm8x4, 3 => Uint32],
+                    }],
+                },
+                primitive: wgpu::PrimitiveState { topology, ..Default::default() },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: false,
+                    depth_compare: wgpu::CompareFunction::Less,
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_mesh_alpha"),
+                    compilation_options: Default::default(),
+                    targets: &[
+                        Some(wgpu::ColorTargetState {
+                            format: COLOR_FORMAT,
+                            blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        }),
+                        Some(wgpu::ColorTargetState {
+                            format: PICK_FORMAT,
+                            blend: None,
+                            write_mask: wgpu::ColorWrites::empty(),
+                        }),
+                    ],
+                }),
+                multiview: None,
+                cache: None,
+            })
+        };
+        // Overlay variants of the impostor pipelines: the ghost of a line behind
+        // the molecule (faint, blended, only where something is in front), and
+        // gizmo spheres that ignore depth entirely.
+        let make_instanced = |label: &str,
+                              vs: &str,
+                              fs: &str,
+                              stride: usize,
+                              attributes: &[wgpu::VertexAttribute],
+                              compare: wgpu::CompareFunction,
+                              ghost: bool| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some(vs),
+                    compilation_options: Default::default(),
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: stride as u64,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes,
+                    }],
+                },
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: false,
+                    depth_compare: compare,
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some(fs),
+                    compilation_options: Default::default(),
+                    targets: &[
+                        Some(wgpu::ColorTargetState {
+                            format: COLOR_FORMAT,
+                            blend: ghost.then_some(wgpu::BlendState::ALPHA_BLENDING),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        }),
+                        Some(wgpu::ColorTargetState {
+                            format: PICK_FORMAT,
+                            blend: None,
+                            write_mask: if ghost { wgpu::ColorWrites::empty() } else { wgpu::ColorWrites::ALL },
+                        }),
+                    ],
+                }),
+                multiview: None,
+                cache: None,
+            })
+        };
+        let ghost_pipeline = make_instanced(
+            "ghost cylinders",
+            "vs_cylinder",
+            "fs_cylinder_ghost",
+            std::mem::size_of::<CylinderInstance>(),
+            &wgpu::vertex_attr_array![
+                0 => Float32x3, 1 => Float32, 2 => Float32x3,
+                3 => Unorm8x4, 4 => Unorm8x4, 5 => Uint32, 6 => Uint32
+            ],
+            wgpu::CompareFunction::Greater,
+            true,
+        );
+        let gizmo_pipeline = make_instanced(
+            "gizmos",
+            "vs_sphere",
+            "fs_sphere",
+            std::mem::size_of::<SphereInstance>(),
+            &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32, 2 => Unorm8x4, 3 => Uint32],
+            wgpu::CompareFunction::Always,
+            false,
+        );
+        let translucent_pipeline = make_blended("translucent", wgpu::PrimitiveTopology::TriangleList);
+        let wire_pipeline = make_blended("wire", wgpu::PrimitiveTopology::LineList);
+
+        // The overlay lives in world space: an identity placement that
+        // reports `OVERLAY_ENTITY` when picked.
+        let overlay_uniform = {
+            use wgpu::util::DeviceExt;
+            let uniform = EntityUniform {
+                model: Mat4::IDENTITY.to_cols_array_2d(),
+                info: [OVERLAY_ENTITY as u32, 0, 0, 0],
+            };
+            let mut bytes = vec![0u8; ENTITY_STRIDE as usize];
+            bytes[..std::mem::size_of::<EntityUniform>()].copy_from_slice(bytemuck::bytes_of(&uniform));
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("overlay uniform"),
+                contents: &bytes,
+                usage: wgpu::BufferUsages::UNIFORM,
+            })
+        };
+        let overlay_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("overlay"),
+            layout: &entity_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &overlay_uniform,
+                    offset: 0,
+                    size: wgpu::BufferSize::new(std::mem::size_of::<EntityUniform>() as u64),
+                }),
+            }],
+        });
+
         let pick_readback = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("pick readback"),
             size: wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as u64,
@@ -277,6 +509,13 @@ impl Renderer {
             sphere_pipeline,
             cylinder_pipeline,
             mesh_pipeline,
+            translucent_pipeline,
+            wire_pipeline,
+            ghost_pipeline,
+            gizmo_pipeline,
+            overlay: None,
+            overlay_uniform,
+            overlay_bind_group,
             globals,
             bind_group,
             entity_layout,
@@ -311,14 +550,104 @@ impl Renderer {
         if self.entities.len() <= slot {
             self.entities.resize_with(slot + 1, || None);
         }
-        let (transform, visible) = self.entities[slot]
-            .as_ref()
-            .map(|e| (e.transform, e.visible))
-            .unwrap_or((Mat4::IDENTITY, true));
+        let (transform, visible, volume) = match self.entities[slot].take() {
+            Some(e) => (e.transform, e.visible, e.volume),
+            None => (Mat4::IDENTITY, true, None),
+        };
         self.entities[slot] = Some(EntityBuffers {
             transform,
             visible,
+            volume,
             ..buffers
+        });
+    }
+
+    /// Wrap the selected atoms of an entity in a translucent (or wireframe)
+    /// surface that follows the entity's placement; `None` removes it.
+    /// Rebuilt from `structure`'s current coordinates, so call it again after
+    /// the entity's geometry is uploaded again.
+    pub fn set_entity_volume(&mut self, slot: usize, structure: &Structure, volume: Option<&Volume>) {
+        use wgpu::util::DeviceExt;
+        let buffers = volume.and_then(|v| {
+            let color = |atom: usize| v.colors.get(atom).copied().unwrap_or([128, 160, 255, 90]);
+            let mesh = surface::gaussian(structure, &v.selected, &color);
+            if mesh.indices.is_empty() {
+                return None;
+            }
+            let buf = |label: &str, bytes: &[u8], usage| {
+                self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some(label), contents: bytes, usage })
+            };
+            let wire = v.wire.then(|| {
+                // Each triangle's three edges once (shared edges are drawn twice, which is invisible).
+                let mut lines: Vec<u32> = Vec::with_capacity(mesh.indices.len() * 2);
+                for t in mesh.indices.chunks_exact(3) {
+                    lines.extend([t[0], t[1], t[1], t[2], t[2], t[0]]);
+                }
+                (buf("volume wire", bytemuck::cast_slice(&lines), wgpu::BufferUsages::INDEX), lines.len() as u32)
+            });
+            Some(VolumeBuffers {
+                vertices: buf("volume vertices", bytemuck::cast_slice(&mesh.vertices), wgpu::BufferUsages::VERTEX),
+                indices: buf("volume indices", bytemuck::cast_slice(&mesh.indices), wgpu::BufferUsages::INDEX),
+                index_count: mesh.indices.len() as u32,
+                wire,
+            })
+        });
+        if let Some(Some(e)) = self.entities.get_mut(slot) {
+            e.volume = buffers;
+        }
+    }
+
+    /// Replace the overlay: measurement lines, the docking box, handles.
+    pub fn set_overlay(&mut self, overlay: &Overlay) {
+        use wgpu::util::DeviceExt;
+        let buffer = |label: &str, contents: &[u8], usage| {
+            (!contents.is_empty()).then(|| {
+                self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some(label), contents, usage })
+            })
+        };
+        let cylinders: Vec<CylinderInstance> = overlay
+            .cylinders
+            .iter()
+            .map(|c| CylinderInstance {
+                p0: c.p0,
+                radius: c.radius,
+                p1: c.p1,
+                color0: c.color,
+                color1: c.color,
+                id0: c.id,
+                id1: c.id,
+            })
+            .collect();
+        let spheres: Vec<SphereInstance> = overlay
+            .spheres
+            .iter()
+            .map(|s| SphereInstance { center: s.center, radius: s.radius, color: s.color, id: s.id })
+            .collect();
+        let handles: Vec<SphereInstance> = overlay
+            .handles
+            .iter()
+            .map(|s| SphereInstance { center: s.center, radius: s.radius, color: s.color, id: s.id })
+            .collect();
+        let mut mesh = scene::Mesh::default();
+        for face in &overlay.faces {
+            let c = face.corners.map(glam::Vec3::from_array);
+            let normal = (c[1] - c[0]).cross(c[3] - c[0]).normalize_or_zero().to_array();
+            let base = mesh.vertices.len() as u32;
+            for p in c {
+                mesh.vertices.push(MeshVertex { position: p.to_array(), normal, color: face.color, id: 0 });
+            }
+            mesh.indices.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
+        }
+        self.overlay = Some(OverlayBuffers {
+            cylinders: buffer("overlay cylinders", bytemuck::cast_slice(&cylinders), wgpu::BufferUsages::VERTEX),
+            cylinder_count: cylinders.len() as u32,
+            spheres: buffer("overlay spheres", bytemuck::cast_slice(&spheres), wgpu::BufferUsages::VERTEX),
+            sphere_count: spheres.len() as u32,
+            faces: buffer("overlay face vertices", bytemuck::cast_slice(&mesh.vertices), wgpu::BufferUsages::VERTEX)
+                .zip(buffer("overlay face indices", bytemuck::cast_slice(&mesh.indices), wgpu::BufferUsages::INDEX)),
+            face_index_count: mesh.indices.len() as u32,
+            handles: buffer("overlay handles", bytemuck::cast_slice(&handles), wgpu::BufferUsages::VERTEX),
+            handle_count: handles.len() as u32,
         });
     }
 
@@ -365,6 +694,7 @@ impl Renderer {
             index_count: data.mesh.indices.len() as u32,
             transform: Mat4::IDENTITY,
             visible: true,
+            volume: None,
         }
     }
 
@@ -534,6 +864,64 @@ impl Renderer {
                     pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..scene.index_count, 0, 0..1);
                 }
+            }
+
+            // Overlay shapes that are solid: lines, boxes' edges, handles.
+            pass.set_bind_group(1, &self.overlay_bind_group, &[0]);
+            if let Some(o) = &self.overlay {
+                if let Some(cylinders) = &o.cylinders {
+                    pass.set_pipeline(&self.cylinder_pipeline);
+                    pass.set_vertex_buffer(0, cylinders.slice(..));
+                    pass.draw(0..6, 0..o.cylinder_count);
+                }
+                if let Some(spheres) = &o.spheres {
+                    pass.set_pipeline(&self.sphere_pipeline);
+                    pass.set_vertex_buffer(0, spheres.slice(..));
+                    pass.draw(0..6, 0..o.sphere_count);
+                }
+            }
+
+            // Where the molecule hides an overlay line, a faint ghost of it.
+            if let Some(o) = &self.overlay
+                && let Some(cylinders) = &o.cylinders
+            {
+                pass.set_pipeline(&self.ghost_pipeline);
+                pass.set_vertex_buffer(0, cylinders.slice(..));
+                pass.draw(0..6, 0..o.cylinder_count);
+            }
+
+            // Then everything translucent, over the opaque scene.
+            for (slot, scene) in self.entities.iter().enumerate() {
+                let Some(scene) = scene.as_ref().filter(|e| e.visible) else { continue };
+                let Some(volume) = &scene.volume else { continue };
+                pass.set_bind_group(1, &self.entity_bind_group, &[(slot as u64 * ENTITY_STRIDE) as u32]);
+                pass.set_vertex_buffer(0, volume.vertices.slice(..));
+                pass.set_pipeline(&self.translucent_pipeline);
+                pass.set_index_buffer(volume.indices.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..volume.index_count, 0, 0..1);
+                if let Some((lines, count)) = &volume.wire {
+                    pass.set_pipeline(&self.wire_pipeline);
+                    pass.set_index_buffer(lines.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..*count, 0, 0..1);
+                }
+            }
+            if let Some((vertices, indices)) = self.overlay.as_ref().and_then(|o| o.faces.as_ref()) {
+                pass.set_bind_group(1, &self.overlay_bind_group, &[0]);
+                pass.set_pipeline(&self.translucent_pipeline);
+                pass.set_vertex_buffer(0, vertices.slice(..));
+                pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
+                let count = self.overlay.as_ref().map(|o| o.face_index_count).unwrap_or(0);
+                pass.draw_indexed(0..count, 0, 0..1);
+            }
+
+            // Handles last and on top, so they can always be seen and grabbed.
+            if let Some(o) = &self.overlay
+                && let Some(handles) = &o.handles
+            {
+                pass.set_bind_group(1, &self.overlay_bind_group, &[0]);
+                pass.set_pipeline(&self.gizmo_pipeline);
+                pass.set_vertex_buffer(0, handles.slice(..));
+                pass.draw(0..6, 0..o.handle_count);
             }
         }
         encoder.copy_texture_to_buffer(

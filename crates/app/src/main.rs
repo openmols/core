@@ -2,9 +2,15 @@
 //!
 //! Usage: `openmols [project-folder | structure-file]`
 
+mod annotations;
+mod autodock_ui;
 mod chat;
 mod config;
+mod example;
+mod job_dialogs;
 mod jobs_ui;
+mod measure_panel;
+mod settings;
 mod tools;
 mod viewer;
 mod workspace;
@@ -14,10 +20,29 @@ use gpui_component::{Root, Theme, ThemeMode};
 use std::path::PathBuf;
 use workspace::Workspace;
 
+/// Write panics to `crash.log` beside the config: a GUI app has no console.
+fn install_panic_log() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let dir = config::config_dir();
+        std::fs::create_dir_all(&dir).ok();
+        let entry = format!(
+            "{info}\n{}\n\n",
+            std::backtrace::Backtrace::force_capture()
+        );
+        let path = dir.join("crash.log");
+        let mut log = std::fs::read_to_string(&path).unwrap_or_default();
+        log.push_str(&entry);
+        std::fs::write(path, log).ok();
+        default(info);
+    }));
+}
+
 fn main() {
+    install_panic_log();
     let initial: Option<PathBuf> = std::env::args_os().nth(1).map(PathBuf::from);
 
-    Application::new().run(move |cx: &mut App| {
+    Application::new().with_assets(gpui_component_assets::Assets).run(move |cx: &mut App| {
         gpui_component::init(cx);
         Theme::change(ThemeMode::Dark, None, cx);
 

@@ -10,6 +10,8 @@ mod pdb;
 mod sdf;
 mod write;
 pub mod align;
+pub mod analysis;
+pub mod geometry;
 pub mod secondary;
 
 use anyhow::{Context, Result, bail};
@@ -85,9 +87,26 @@ pub struct Structure {
     pub frames: Vec<Vec<Vec3>>,
 }
 
+/// True for PDB-format names: `.pdb`, biological assemblies such as `.pdb1`,
+/// plus the older `.ent` and `.brk`. The name must already be lowercase and
+/// have any `.gz` stripped.
+pub fn is_pdb_like(lower: &str) -> bool {
+    if lower.ends_with(".ent") || lower.ends_with(".brk") {
+        return true;
+    }
+    match lower.rsplit_once(".pdb") {
+        // ".pdb" itself, or ".pdb1" / ".pdb2" for assemblies.
+        Some((_, rest)) => rest.is_empty() || rest.chars().all(|c| c.is_ascii_digit()),
+        None => false,
+    }
+}
+
 impl Structure {
     /// Load a structure, choosing the parser from the file extension.
-    /// Supported: `.pdb`, `.ent`, `.cif`, `.mmcif` (optionally `.gz`), `.sdf`, `.mol`.
+    ///
+    /// Supported: PDB (`.pdb`, biological assemblies `.pdb1`…, `.ent`,
+    /// `.brk`), mmCIF (`.cif`, `.mmcif`), MDL (`.sdf`, `.mol`), each
+    /// optionally `.gz`.
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let lower = path.to_string_lossy().to_lowercase();
@@ -96,13 +115,13 @@ impl Structure {
             let text = std::fs::read_to_string(path)
                 .with_context(|| format!("reading {}", path.display()))?;
             sdf::parse(&text)?
-        } else if [".pdb", ".ent", ".cif", ".mmcif"]
-            .iter()
-            .any(|ext| lower.ends_with(ext))
-        {
+        } else if is_pdb_like(lower) || lower.ends_with(".cif") || lower.ends_with(".mmcif") {
             pdb::load(path)?
         } else {
-            bail!("unsupported file type: {}", path.display());
+            bail!(
+                "unsupported file type: {} (expected .pdb, .cif, .sdf or .mol)",
+                path.display()
+            );
         };
         structure.secondary = secondary::assign(&structure);
         if structure.name.is_empty() {

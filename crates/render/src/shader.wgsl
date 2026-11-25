@@ -190,8 +190,7 @@ fn vs_cylinder(@builtin(vertex_index) vi: u32, inst: CylIn) -> CylVary {
     return o;
 }
 
-@fragment
-fn fs_cylinder(v: CylVary) -> FragOut {
+fn cylinder_fragment(v: CylVary) -> FragOut {
     let dir = normalize(v.view_pos);
     let axis = v.p1 - v.p0;
     let len = length(axis);
@@ -220,6 +219,11 @@ fn fs_cylinder(v: CylVary) -> FragOut {
     out.pick = pick_id(select(v.id0, v.id1, second));
     out.depth = depth_of(hit);
     return out;
+}
+
+@fragment
+fn fs_cylinder(v: CylVary) -> FragOut {
+    return cylinder_fragment(v);
 }
 
 // ------------------------------------------------------------------ meshes
@@ -263,5 +267,52 @@ fn fs_mesh(v: MeshVary) -> FragOut {
     out.color = shade(v.color, n, v.view_pos);
     out.pick = pick_id(v.id);
     out.depth = v.clip.z;
+    return out;
+}
+
+// ------------------------------------------- translucent meshes and wireframes
+
+struct MeshAlphaVary {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) view_pos: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) color: vec4<f32>,
+    @location(3) @interpolate(flat) id: u32,
+};
+
+@vertex
+fn vs_mesh_alpha(v: MeshIn) -> MeshAlphaVary {
+    let p = (model_view() * vec4(v.position, 1.0)).xyz;
+    var o: MeshAlphaVary;
+    o.clip = g.proj * vec4(p, 1.0);
+    o.view_pos = p;
+    o.normal = (model_view() * vec4(v.normal, 0.0)).xyz;
+    o.color = v.color;
+    o.id = v.id;
+    return o;
+}
+
+// Blended over what is already drawn; the pick target is masked off for this
+// pipeline, so translucent shapes never intercept clicks.
+@fragment
+fn fs_mesh_alpha(v: MeshAlphaVary) -> FragOut {
+    var n = normalize(v.normal);
+    if dot(n, -v.view_pos) < 0.0 {
+        n = -n;
+    }
+    var out: FragOut;
+    let lit = shade(v.color.rgb, n, v.view_pos);
+    out.color = vec4(lit.rgb, v.color.a);
+    out.pick = pick_id(v.id);
+    out.depth = v.clip.z;
+    return out;
+}
+
+// A faint copy of an overlay cylinder, drawn only where the molecule hides the
+// real one, so lines and box edges stay readable behind atoms.
+@fragment
+fn fs_cylinder_ghost(v: CylVary) -> FragOut {
+    var out = cylinder_fragment(v);
+    out.color = vec4(out.color.rgb, 0.4);
     return out;
 }

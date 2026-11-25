@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Hosted runners have no (or only a software) GPU; the renderer's headless
+  # tests skip themselves when this is set.
+  OPENMOLS_SKIP_GPU_TESTS: "1"
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@1.89.0
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Linux packages
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config cmake clang \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libxcb1-dev libx11-xcb-dev \
+            libxcb-xkb-dev libfontconfig1-dev libfreetype6-dev libssl-dev libvulkan-dev libasound2-dev
+
+      # GPUI compiles Metal shaders at build time; newer Xcode images ship the
+      # Metal toolchain as a separate component.
+      - name: Metal toolchain
+        if: runner.os == 'macOS'
+        run: xcodebuild -downloadComponent MetalToolchain || true
+
+      - name: Build everything (app, libraries, tests, examples)
+        run: cargo build --workspace --all-targets
+
+      - name: Test
+        run: cargo test --workspace
