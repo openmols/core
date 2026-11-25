@@ -15,7 +15,7 @@ against them or ship their code.
 | [RDKit](https://www.rdkit.org/) | BSD-3-Clause | conda-forge `rdkit` |
 | [Open Babel](https://openbabel.org/) | GPL-2.0 | conda-forge `openbabel` |
 | [pyKVFinder](https://github.com/LBC-LNBio/pyKVFinder) | GPL-3.0 | `docker/pykvfinder/Dockerfile` (pip) |
-| [FRODOCK](https://github.com/chaconlab/FRODOCK) | no licence published | published only with the authors' permission (switched off by default): see below |
+| [FRODOCK](https://github.com/chaconlab/FRODOCK) | GPL-2.0-or-later notices in about half the sources; none in the core docking code; no top-level `LICENSE` | image publishing is switched off until the authors confirm: see below |
 
 ### Where the images come from
 
@@ -34,18 +34,28 @@ FRODOCK is a special case (see below).
 
 ### FRODOCK
 
-The FRODOCK repository carries no licence file, so by default nobody may redistribute it.
-openmols therefore does not ship it, and the CI job that would publish a FRODOCK image
-(`frodock` in `.github/workflows/containers.yml`) is **switched off** until the maintainers
-have the authors' permission and set the repository variable `PUBLISH_FRODOCK` to `true`.
+FRODOCK is public on GitHub (<https://github.com/chaconlab/FRODOCK>), but the repository has no
+top-level `LICENSE` file. Reading the sources (as of this writing):
+
+- about half the source files (the libraries `libvolume`, `libfrm`, parts of `libpdb`, and
+  others) carry **GPL-2.0-or-later** notices, and the bundled TCLAP library carries its own
+  permissive notice;
+- the core docking programs and libraries (`frodock`, `libfrodock`, `libprotprot`, `libbessel`,
+  `frodockcluster`, ...) carry **no licence notice**;
+- the bundled `bin/soap.bin` scoring potential has no stated terms.
+
+The intent looks like GPL, but the core files have no explicit grant. So the CI job that would
+publish a FRODOCK image (`frodock` in `.github/workflows/containers.yml`) is **switched off**
+until the maintainers have confirmed this with the authors (ideally by the authors adding a
+`LICENSE` file) and set the repository variable `PUBLISH_FRODOCK` to `true`.
 
 - While it is off, users build the image on their own machine from their own copy of FRODOCK
   (**Settings → Tools**).
 - Once it is on, the app pulls `ghcr.io/openmols/frodock` like the other images and the folder
-  is only a fallback.
+  is only a fallback. The image contains FRODOCK's full source tree (`/opt/frodock`), which
+  covers the source-availability part of the GPL for the files that carry it.
 
-Do not turn the switch on without that permission, and check the authors' terms before
-sharing a built image or using it commercially.
+Check the authors' terms before using FRODOCK commercially.
 
 ## Please cite what you use
 
