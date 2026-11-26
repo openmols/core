@@ -15,7 +15,7 @@ against them or ship their code.
 | [RDKit](https://www.rdkit.org/) | BSD-3-Clause | conda-forge `rdkit` |
 | [Open Babel](https://openbabel.org/) | GPL-2.0 | conda-forge `openbabel` |
 | [pyKVFinder](https://github.com/LBC-LNBio/pyKVFinder) | GPL-3.0 | `docker/pykvfinder/Dockerfile` (pip) |
-| [FRODOCK](https://github.com/chaconlab/FRODOCK) | GPL-2.0-or-later notices in about half the sources; none in the core docking code; no top-level `LICENSE` | image publishing is switched off until the authors confirm: see below |
+| [FRODOCK](https://github.com/chaconlab/FRODOCK) | GPL-2.0-or-later notices in about half the sources; none in the core docking code; no top-level `LICENSE` | image published to ghcr.io while we wait for the authors to confirm: see below |
 
 ### Where the images come from
 
@@ -44,16 +44,17 @@ top-level `LICENSE` file. Reading the sources (as of this writing):
   `frodockcluster`, ...) carry **no licence notice**;
 - the bundled `bin/soap.bin` scoring potential has no stated terms.
 
-The intent looks like GPL, but the core files have no explicit grant. So the CI job that would
-publish a FRODOCK image (`frodock` in `.github/workflows/containers.yml`) is **switched off**
-until the maintainers have confirmed this with the authors (ideally by the authors adding a
-`LICENSE` file) and set the repository variable `PUBLISH_FRODOCK` to `true`.
+The intent looks like GPL, but the core files have no explicit grant. We have asked the authors
+to confirm the terms (ideally by adding a `LICENSE` file):
+<https://github.com/chaconlab/FRODOCK/issues/1>.
 
-- While it is off, users build the image on their own machine from their own copy of FRODOCK
-  (**Settings → Tools**).
-- Once it is on, the app pulls `ghcr.io/openmols/frodock` like the other images and the folder
-  is only a fallback. The image contains FRODOCK's full source tree (`/opt/frodock`), which
-  covers the source-availability part of the GPL for the files that carry it.
+- The image `ghcr.io/openmols/frodock` is published by the `frodock` job in
+  `.github/workflows/containers.yml`, behind the repository variable `PUBLISH_FRODOCK`.
+  It contains FRODOCK's full source tree (`/opt/frodock`), and its licence label is
+  `NOASSERTION` because the authors have not stated one.
+- **If the authors object, or say no**, we take the image down: set `PUBLISH_FRODOCK` to
+  `false`, delete the `frodock` package on GitHub, and update this page.
+- Users who prefer to build it themselves can point **Settings -> Tools** at their own copy.
 
 Check the authors' terms before using FRODOCK commercially.
 
