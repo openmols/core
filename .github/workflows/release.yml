@@ -91,7 +91,7 @@ jobs:
             <key>CFBundleIdentifier</key><string>org.openmols.app</string>
             <key>CFBundleExecutable</key><string>openmols</string>
             <key>CFBundlePackageType</key><string>APPL</string>
-            <key>CFBundleShortVersionString</key><string>0.1.0</string>
+            <key>CFBundleShortVersionString</key><string>0.0.1</string>
             <key>LSMinimumSystemVersion</key><string>12.0</string>
             <key>NSHighResolutionCapable</key><true/>
           </dict>
