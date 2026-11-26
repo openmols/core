@@ -26,3 +26,8 @@ debug = "line-tables-only"
 
 [profile.dev.package."*"]
 debug = false
+
+# xattr 0.2.3 (a dependency of GPUI) does not compile on Linux with current libc;
+# see vendor/xattr/PATCHED.md.
+[patch.crates-io]
+xattr = { path = "vendor/xattr" }

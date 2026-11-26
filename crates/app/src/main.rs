@@ -2,6 +2,10 @@
 //!
 //! Usage: `openmols [project-folder | structure-file]`
 
+// Release builds on Windows are GUI programs: no console window behind the app.
+// (Nothing here prints; panics go to `crash.log`.)
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod annotations;
 mod autodock_ui;
 mod chat;

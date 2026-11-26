@@ -382,7 +382,7 @@ impl SettingsView {
                         workspace2.update(cx, |ws, cx| ws.check_docker(cx)).ok();
                     }),
             )
-            .child(div().pt_2().child(Self::label("FRODOCK folder (your own copy; the Docker image is built from it)")))
+            .child(div().pt_2().child(Self::label("FRODOCK folder (optional: only needed to build the image yourself if it cannot be downloaded)")))
             .child(div().text_sm().child(match frodock {
                 Some(dir) => dir.display().to_string(),
                 None => "not set".to_string(),

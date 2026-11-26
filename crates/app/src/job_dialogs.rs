@@ -188,12 +188,6 @@ impl JobDialog {
         let engine = self.engine;
         let warhead = self.warhead;
 
-        if kind == JobKind::Dock {
-            let ready = ws.read(cx).config.frodock_dir.is_some();
-            if !ready {
-                return Err("set your FRODOCK folder first (Settings → Tools)".into());
-            }
-        }
         ws.update(cx, |ws, cx| {
             if let Some((centre, size, exhaustiveness, modes, covalent)) = &autodock {
                 let d = &mut ws.config.job_defaults;
@@ -507,10 +501,9 @@ impl Render for JobDialog {
                     );
                 if !frodock {
                     body = body.child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(0xd8a657))
-                            .child("FRODOCK is not redistributed: set your own copy in Settings → Tools."),
+                        div().text_xs().text_color(muted()).child(
+                            "The FRODOCK image is downloaded on first use. If that is not possible, set your own copy in Settings → Tools.",
+                        ),
                     );
                 }
             }
@@ -518,7 +511,7 @@ impl Render for JobDialog {
         if let Some(e) = &self.error {
             body = body.child(div().text_xs().text_color(rgb(0xff9b94)).child(e.clone()));
         }
-        let running_blocked = kind == JobKind::Dock && self.workspace.upgrade().is_some_and(|ws| ws.read(cx).config.frodock_dir.is_none());
+        let running_blocked = false;
         body.child(
             div()
                 .flex()

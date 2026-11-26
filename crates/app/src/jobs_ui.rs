@@ -293,7 +293,7 @@ impl Workspace {
                 let result = (|| -> Result<i32> {
                     jobs::docker_version()?;
                     if !jobs::image_present(&worker_spec.image) {
-                        jobs::build_image(
+                        jobs::ensure_image(
                             &worker_spec.image,
                             context.as_deref(),
                             &worker_spec.host_dir().join("build.log"),
@@ -1201,12 +1201,9 @@ impl Workspace {
                 (receptor, ligand, false)
             }
         };
-        self.config
-            .frodock_dir
-            .as_ref()
-            .context("set your FRODOCK folder in the Tools panel first — openmols does not download it")?;
-        let project = self.config.frodock_dir.as_ref().and(self.project.as_ref())
-            .context("open or create a project first")?;
+        // The image is pulled on first use; only if that fails is your own
+        // copy of FRODOCK (Settings → Tools) needed to build it.
+        let project = self.project.as_ref().context("open or create a project first")?;
 
         let export = |index: usize| -> Result<(String, String)> {
             let viewer = self.viewer.read(cx);
@@ -1528,7 +1525,6 @@ impl Workspace {
         let has_ensemble = viewer.active().is_some_and(|e| e.structure.frame_count() > 1);
         let entities = viewer.entities().len();
         let has_project = self.project.is_some();
-        let frodock_ready = self.config.frodock_dir.is_some();
         panel = panel.child(
             div()
                 .flex()
@@ -1603,14 +1599,6 @@ impl Workspace {
                         }
                         cx.notify();
                     })),
-            );
-        }
-        if !frodock_ready && entities >= 2 {
-            panel = panel.child(
-                div()
-                    .text_xs()
-                    .text_color(muted())
-                    .child("FRODOCK (protein-protein docking) needs your own FRODOCK folder: Settings → Tools."),
             );
         }
 

@@ -9,6 +9,35 @@ detection that run in Docker, measurement tools, and an LLM assistant that drive
 *The 1HSG protease rendered headlessly by the same renderer the app uses: a translucent
 surface coloured by distance to the ligand, a docking box with drag handles, and depth-correct overlays.*
 
+## Download
+
+Get the latest build from the **[Releases page](https://github.com/openmols/core/releases)**.
+Everything the app needs is inside the one program: nothing to install except Docker, if you
+want to run docking or pocket detection.
+
+| System | File | Run it |
+| --- | --- | --- |
+| Windows 10/11 (x64) | `openmols-…-windows-x64.zip` | unzip, double-click `openmols.exe` |
+| macOS 12+ (Apple silicon) | `openmols-…-macos-arm64.zip` | unzip, open `OpenMols.app` |
+| Linux (x86-64) | `openmols-…-linux-x64.tar.gz` | `tar xzf …`, then `./openmols` |
+
+The builds are not code-signed yet, so your system will ask before the first launch:
+
+- **Windows:** SmartScreen says "Windows protected your PC": choose **More info → Run anyway**.
+- **macOS:** right-click `OpenMols.app` → **Open** → **Open**, or run
+  `xattr -dr com.apple.quarantine OpenMols.app`.
+- **Linux:** needs a Vulkan driver and the usual desktop libraries
+  (`libxkbcommon`, `libwayland-client`, `libxcb`, `libfontconfig`; install your distribution's packages).
+
+Intel Macs and other Linux architectures: build from source for now (below).
+The viewer, measurements and the assistant work without Docker; docking and pockets need
+[Docker](https://www.docker.com/) running (Docker Desktop on Windows and macOS).
+The tool images (pyKVFinder, AutoDock) are published from this repository to
+`ghcr.io/openmols/…` and pulled automatically the first time you run a job (the AutoDock image
+is about 1.8 GB); if the pull fails, openmols builds the same image locally from its
+Dockerfile. FRODOCK has no published licence, so its image is only published once the authors
+have given permission; until then it is built from your own copy (Settings → Tools).
+
 ## What it does
 
 - **Viewer.** Cartoon, Gaussian surface, ball & stick, spacefill, licorice and backbone, with
@@ -32,15 +61,15 @@ surface coloured by distance to the ligand, a docking box with drag handles, and
 ## Try it in two minutes
 
 1. Install Docker (Docker Desktop on Windows and macOS) and start it.
-2. Build and run (below).
+2. Download and start openmols (above), or build it yourself (below).
 3. **Project tab → Load the example.** It sets up HIV protease and its inhibitor indinavir
    (PDB 1HSG) as two entities with a search box.
 4. **Jobs tab → Dock (AutoDock)… → Run.** The first run pulls and builds the image once.
    Redocking indinavir with Vina scores about −11.6 kcal/mol and lands within 0.3 Å of the crystal pose.
 
-## Build
+## Build from source
 
-You need a recent stable Rust (the repository pins one in `rust-toolchain.toml`) and a GPU
+Only needed for development, other platforms, or the newest changes. You need Rust (the repository pins a version in `rust-toolchain.toml`) and a GPU
 with a Vulkan, Metal or DirectX 12 driver.
 
 ```sh
@@ -52,8 +81,8 @@ cargo test --workspace
 | Platform | Status |
 | --- | --- |
 | Windows 11 | developed and used daily |
-| Linux | built and tested in CI; not yet used interactively |
-| macOS | built and tested in CI; not yet used interactively |
+| Linux | built and tested in CI; release builds from CI; not yet used interactively |
+| macOS (Apple silicon) | built and tested in CI; release builds from CI; not yet used interactively |
 
 Reports from Linux and macOS users are especially welcome.
 

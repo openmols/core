@@ -33,8 +33,12 @@ are the template.
 
 1. **Image.** `docker/<tool>/Dockerfile`, built from packages that can be redistributed
    (conda-forge, bioconda, apt). If the software cannot be redistributed, build the image
-   from a folder the user supplies, as FRODOCK does (`needs_context`). Register it in
-   `crates/jobs/src/lib.rs` (`ToolImage`, `TOOLS`).
+   from a folder the user supplies, as FRODOCK does (`needs_context`), and publish it only behind a
+   `PUBLISH_*` switch once you have permission. Register it in
+   `crates/jobs/src/lib.rs` (`ToolImage`, `TOOLS`), give redistributable images a `registry`
+   name, add the tool to the matrix in `.github/workflows/containers.yml` (a test keeps the
+   names and `IMAGE_VERSION` in step), and put OCI `source` and `licenses` labels in the
+   Dockerfile. Bump the `:N` tag everywhere when a Dockerfile changes.
 2. **Command builder and parser** in `crates/jobs/src/<tool>.rs`.
    `command(settings) -> Result<String>` returns the shell script run in the job folder;
    refuse bad input there (it ends up in a shell). Write `parse_*` against a real output
@@ -47,6 +51,14 @@ are the template.
 5. **Assistant tool.** Add a spec and a dispatch arm in `crates/app/src/tools.rs`
    (jobs that take minutes are dispatched in `chat.rs`).
 6. Update `ROADMAP.md` and `docs/LICENSES.md`.
+
+## Releases
+
+Pushing a tag like `v0.1.0` runs `.github/workflows/release.yml`, which builds the app for
+Windows, macOS (Apple silicon) and Linux, packages it, and attaches the archives and a
+`SHA256SUMS.txt` to a GitHub Release. Before tagging, bump `version` in the root `Cargo.toml`
+and the version string in the macOS `Info.plist` step of the workflow. "Run workflow" on the
+Release workflow builds the same archives without publishing, which is a good dry run.
 
 ## Pull requests
 

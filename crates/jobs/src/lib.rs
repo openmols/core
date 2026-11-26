@@ -25,6 +25,11 @@ pub struct ToolImage {
     pub label: &'static str,
     /// Image tag; bump the version when the Dockerfile changes.
     pub tag: &'static str,
+    /// Where CI publishes the same image (same version as `tag`). Pulled on
+    /// first use instead of building. `needs_context` images (FRODOCK) are
+    /// only published while the maintainers have permission to redistribute
+    /// them; when the pull fails they are built from the user's own copy.
+    pub registry: Option<&'static str>,
     pub dockerfile: &'static str,
     pub gpu: bool,
     /// Built from a folder the user supplies (software we must not download
@@ -37,6 +42,7 @@ pub const PYKVFINDER: ToolImage = ToolImage {
     tool: "pykvfinder",
     label: "pyKVFinder",
     tag: "openmols/pykvfinder:1",
+    registry: Some("ghcr.io/openmols/pykvfinder:1"),
     dockerfile: include_str!("../../../docker/pykvfinder/Dockerfile"),
     gpu: false,
     needs_context: false,
@@ -47,6 +53,7 @@ pub const FRODOCK: ToolImage = ToolImage {
     tool: "frodock",
     label: "FRODOCK",
     tag: "openmols/frodock:1",
+    registry: Some("ghcr.io/openmols/frodock:1"),
     dockerfile: include_str!("../../../docker/frodock/Dockerfile"),
     gpu: false,
     needs_context: true,
@@ -57,6 +64,7 @@ pub const AUTODOCK: ToolImage = ToolImage {
     tool: "autodock",
     label: "AutoDock",
     tag: "openmols/autodock:1",
+    registry: Some("ghcr.io/openmols/autodock:1"),
     dockerfile: include_str!("../../../docker/autodock/Dockerfile"),
     gpu: false,
     needs_context: false,
@@ -104,6 +112,50 @@ pub fn image_present(image: &ToolImage) -> bool {
         .is_ok_and(|s| s.success())
 }
 
+/// Make `image` available locally: already there, else pulled from the
+/// project's registry, else built from its Dockerfile.
+///
+/// A pull that fails (offline, the package not public yet, an unsupported
+/// platform) is not an error: the reason goes to `pull.log` beside `log` and
+/// the image is built locally instead.
+pub fn ensure_image(image: &ToolImage, context: Option<&Path>, log: &Path) -> Result<()> {
+    if image_present(image) {
+        return Ok(());
+    }
+    if let Some(registry) = image.registry {
+        let pull_log = log.with_file_name("pull.log");
+        if pull_image(image, registry, &pull_log).is_ok() {
+            return Ok(());
+        }
+    }
+    build_image(image, context, log)
+}
+
+/// `docker pull` the published image and tag it with the local name.
+///
+/// CI publishes linux/amd64; asking for it explicitly lets Apple-silicon Macs
+/// (which run it under emulation) pull it too.
+fn pull_image(image: &ToolImage, registry: &str, log: &Path) -> Result<()> {
+    let log_file = File::create(log).with_context(|| format!("creating {}", log.display()))?;
+    let status = docker()
+        .args(["pull", "--platform", "linux/amd64", registry])
+        .stdout(log_file.try_clone()?)
+        .stderr(log_file)
+        .status()
+        .context("starting docker pull")?;
+    if !status.success() {
+        bail!("docker pull {registry} failed (see {})", log.display());
+    }
+    let tagged = docker()
+        .args(["tag", registry, image.tag])
+        .status()
+        .context("tagging the pulled image")?;
+    if !tagged.success() {
+        bail!("could not tag {registry} as {}", image.tag);
+    }
+    Ok(())
+}
+
 /// `docker build` the image from its embedded Dockerfile, logging to `log`.
 ///
 /// `context` is the build context folder. Images that set `needs_context`
@@ -112,7 +164,7 @@ pub fn image_present(image: &ToolImage) -> bool {
 pub fn build_image(image: &ToolImage, context: Option<&Path>, log: &Path) -> Result<()> {
     if image.needs_context && context.is_none() {
         bail!(
-            "{} is built from your own copy of the software — set its folder in the Tools panel first",
+            "the {} image could not be downloaded, and it can only be built from your own copy of the software — set its folder in Settings → Tools",
             image.label
         );
     }
@@ -220,6 +272,39 @@ pub fn log_tail(path: &Path, lines: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The app pulls `registry` and CI publishes it: the names, versions and
+    /// licence labels have to agree, or users would pull something stale.
+    #[test]
+    fn published_images_match_the_app_and_ci() {
+        let workflow = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows/containers.yml"),
+        )
+        .expect("the containers workflow exists");
+        let version = workflow
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("IMAGE_VERSION:"))
+            .map(|v| v.trim().trim_matches('"').to_string())
+            .expect("the workflow sets IMAGE_VERSION");
+        for t in TOOLS {
+            match t.registry {
+                Some(registry) => {
+                    assert_eq!(registry, format!("ghcr.io/openmols/{}:{version}", t.tool), "{}", t.tool);
+                    assert!(t.tag.ends_with(&format!(":{version}")), "{}: local tag out of step", t.tool);
+                    assert!(workflow.contains(t.tool), "{} is not built by the containers workflow", t.tool);
+                    assert!(t.dockerfile.contains("org.opencontainers.image.licenses"), "{}: no licence label", t.tool);
+                    assert!(t.dockerfile.contains("org.opencontainers.image.source"), "{}: no source label", t.tool);
+                }
+                // Without a published image the only way to get one is the user's own copy.
+                None => assert!(t.needs_context, "{} has no registry image and no user copy", t.tool),
+            }
+            // Software that needs a user copy is only published behind an explicit switch,
+            // so nobody redistributes it by accident.
+            if t.needs_context {
+                assert!(workflow.contains("vars.PUBLISH_"), "{} must be published behind a PUBLISH_* switch", t.tool);
+            }
+        }
+    }
 
     #[test]
     fn dockerfiles_are_embedded() {

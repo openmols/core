@@ -1,0 +1,144 @@
+name: Release
+
+# Publish downloads when a version tag is pushed:
+#   git tag v0.1.0 && git push origin v0.1.0
+# "Run workflow" builds the same archives without publishing (check the artifacts).
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: windows-x64, os: windows-latest, target: x86_64-pc-windows-msvc }
+          - { name: macos-arm64, os: macos-latest, target: aarch64-apple-darwin }
+          - { name: linux-x64, os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@1.89.0
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Linux packages
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config cmake clang \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libxcb1-dev libx11-xcb-dev \
+            libxcb-xkb-dev libfontconfig1-dev libfreetype6-dev libssl-dev libvulkan-dev libasound2-dev
+
+      - name: Metal toolchain
+        if: runner.os == 'macOS'
+        run: xcodebuild -downloadComponent MetalToolchain || true
+
+      - name: Build
+        run: cargo build --release -p app --target ${{ matrix.target }}
+
+      - name: Version
+        id: version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then v="${GITHUB_REF_NAME}"; else v="dev-${GITHUB_SHA::7}"; fi
+          echo "name=openmols-${v}-${{ matrix.name }}" >> "$GITHUB_OUTPUT"
+
+      # Everything the app needs is inside the binary: the viewer, the icons,
+      # the Dockerfiles and the example structure.
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dir = "${{ steps.version.outputs.name }}"
+          New-Item -ItemType Directory $dir | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/openmols.exe" $dir
+          Copy-Item LICENSE, README.md $dir
+          Copy-Item docs/LICENSES.md "$dir/LICENSES.md"
+          Compress-Archive -Path $dir -DestinationPath "$dir.zip"
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          dir="${{ steps.version.outputs.name }}"
+          app="$dir/OpenMols.app/Contents"
+          mkdir -p "$app/MacOS"
+          cp "target/${{ matrix.target }}/release/openmols" "$app/MacOS/openmols"
+          cat > "$app/Info.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>OpenMols</string>
+            <key>CFBundleDisplayName</key><string>OpenMols</string>
+            <key>CFBundleIdentifier</key><string>org.openmols.app</string>
+            <key>CFBundleExecutable</key><string>openmols</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>0.1.0</string>
+            <key>LSMinimumSystemVersion</key><string>12.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          PLIST
+          cp LICENSE README.md "$dir/"
+          cp docs/LICENSES.md "$dir/LICENSES.md"
+          ditto -c -k --keepParent "$dir" "$dir.zip"
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          dir="${{ steps.version.outputs.name }}"
+          mkdir "$dir"
+          cp "target/${{ matrix.target }}/release/openmols" "$dir/"
+          cp LICENSE README.md "$dir/"
+          cp docs/LICENSES.md "$dir/LICENSES.md"
+          tar czf "$dir.tar.gz" "$dir"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            openmols-*.zip
+            openmols-*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum openmols-* > SHA256SUMS.txt
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          body: |
+            Download the archive for your system, unpack it and run `openmols`
+            (macOS: `OpenMols.app`). Docking and pocket detection also need
+            [Docker](https://www.docker.com/) running. See the README for first-run notes.
